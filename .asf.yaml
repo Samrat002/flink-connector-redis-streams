@@ -1,4 +1,14 @@
 github:
+  description: "Apache Flink Redis Streams Connector"
+  homepage: https://flink.apache.org/
+  labels:
+    - flink
+    - redis
+    - streams
+    - connector
+    - big-data
+    - java
+    - real-time
   enabled_merge_buttons:
     squash: true
     merge: false
