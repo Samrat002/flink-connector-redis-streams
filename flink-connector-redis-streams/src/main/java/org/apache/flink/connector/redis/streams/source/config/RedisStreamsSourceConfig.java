@@ -30,24 +30,17 @@ import java.util.UUID;
 /**
  * Configuration for the Redis Streams Source.
  *
- * <h3>Consumer name and rescaling</h3>
+ * <p>Set {@link Builder#setHost} + {@link Builder#setPort} for standalone mode, or {@link
+ * Builder#setClusterNodes} for cluster mode (host/port are ignored when cluster mode is active).
  *
- * <p>If {@code consumerName} is not set, a UUID-suffixed default is generated <em>once on the job
- * client</em> and embedded in the serialized config. The effective per-subtask consumer name is
- * {@code <consumerName>-<subtaskIndex>}. Two consequences worth knowing:
- *
- * <ul>
- *   <li><b>Rescaling</b> changes subtask indices, so a parallelism change orphans PEL entries under
- *       the old subtask-suffixed consumer names. To preserve PEL recovery across rescale, pin
- *       {@code consumerName} explicitly and avoid changing parallelism without draining.
- *   <li><b>Code redeploy without state restore</b> generates a new UUID, which similarly orphans
- *       PEL entries from the previous run.
- * </ul>
+ * <p>The effective per-subtask consumer name is {@code <consumerName>-<subtaskIndex>}. Pinning
+ * {@code consumerName} explicitly is required to preserve PEL recovery across parallelism changes
+ * or redeploys; the default UUID-suffixed name changes on each {@code Builder.build()}.
  */
 @PublicEvolving
 public class RedisStreamsSourceConfig implements Serializable {
 
-    private static final long serialVersionUID = 1L;
+    private static final long serialVersionUID = 2L;
 
     public static final String DEFAULT_CONSUMER_GROUP = "flink-consumer-group";
     public static final String DEFAULT_HOST = "localhost";
@@ -58,6 +51,7 @@ public class RedisStreamsSourceConfig implements Serializable {
     public static final int DEFAULT_MAX_DEFERRED_ACK_QUEUE_SIZE = 10_000;
     public static final long DEFAULT_CIRCUIT_BREAKER_OPEN_DURATION_MS = 5_000L;
     public static final int DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 3;
+    public static final long DEFAULT_CLUSTER_TOPOLOGY_REFRESH_PERIOD_MS = 60_000L;
 
     private static final String CONSUMER_NAME_PREFIX = "flink-consumer-";
     private static final int CONSUMER_NAME_SUFFIX_LENGTH = 8;
@@ -66,6 +60,8 @@ public class RedisStreamsSourceConfig implements Serializable {
     private final int port;
     private final String password;
     private final int database;
+    private final List<String> clusterNodes;
+    private final long clusterTopologyRefreshPeriodMs;
     private final List<String> streamKeys;
     private final String consumerGroup;
     private final String consumerName;
@@ -82,6 +78,8 @@ public class RedisStreamsSourceConfig implements Serializable {
             int port,
             String password,
             int database,
+            List<String> clusterNodes,
+            long clusterTopologyRefreshPeriodMs,
             List<String> streamKeys,
             String consumerGroup,
             String consumerName,
@@ -96,6 +94,8 @@ public class RedisStreamsSourceConfig implements Serializable {
         this.port = port;
         this.password = password;
         this.database = database;
+        this.clusterNodes = Collections.unmodifiableList(new ArrayList<>(clusterNodes));
+        this.clusterTopologyRefreshPeriodMs = clusterTopologyRefreshPeriodMs;
         this.streamKeys = Collections.unmodifiableList(new ArrayList<>(streamKeys));
         this.consumerGroup = consumerGroup;
         this.consumerName = consumerName;
@@ -122,6 +122,18 @@ public class RedisStreamsSourceConfig implements Serializable {
 
     public int getDatabase() {
         return database;
+    }
+
+    public List<String> getClusterNodes() {
+        return clusterNodes;
+    }
+
+    public boolean isClusterMode() {
+        return !clusterNodes.isEmpty();
+    }
+
+    public long getClusterTopologyRefreshPeriodMs() {
+        return clusterTopologyRefreshPeriodMs;
     }
 
     public List<String> getStreamKeys() {
@@ -174,6 +186,8 @@ public class RedisStreamsSourceConfig implements Serializable {
         private int port = DEFAULT_PORT;
         private String password = null;
         private int database = DEFAULT_DATABASE;
+        private List<String> clusterNodes = Collections.emptyList();
+        private long clusterTopologyRefreshPeriodMs = DEFAULT_CLUSTER_TOPOLOGY_REFRESH_PERIOD_MS;
         private List<String> streamKeys;
         private String consumerGroup = DEFAULT_CONSUMER_GROUP;
         private String consumerName;
@@ -202,6 +216,18 @@ public class RedisStreamsSourceConfig implements Serializable {
 
         public Builder setDatabase(int database) {
             this.database = database;
+            return this;
+        }
+
+        /** Activate cluster mode with one or more {@code host:port} seeds. */
+        public Builder setClusterNodes(List<String> clusterNodes) {
+            this.clusterNodes =
+                    clusterNodes == null ? Collections.emptyList() : new ArrayList<>(clusterNodes);
+            return this;
+        }
+
+        public Builder setClusterTopologyRefreshPeriodMs(long periodMs) {
+            this.clusterTopologyRefreshPeriodMs = periodMs;
             return this;
         }
 
@@ -256,9 +282,41 @@ public class RedisStreamsSourceConfig implements Serializable {
         }
 
         public RedisStreamsSourceConfig build() {
-            Preconditions.checkNotNull(host, "host must be set");
-            Preconditions.checkArgument(!host.isEmpty(), "host must not be empty");
-            Preconditions.checkArgument(port > 0 && port <= 65535, "port must be in 1..65535");
+            boolean cluster = clusterNodes != null && !clusterNodes.isEmpty();
+            if (cluster) {
+                for (String node : clusterNodes) {
+                    Preconditions.checkArgument(
+                            node != null && !node.isEmpty(),
+                            "clusterNodes entries must not be null or empty");
+                    int colon = node.indexOf(':');
+                    Preconditions.checkArgument(
+                            colon > 0 && colon < node.length() - 1,
+                            "clusterNodes entries must be of the form host:port: "
+                                    + node);
+                    String hostPart = node.substring(0, colon);
+                    String portPart = node.substring(colon + 1);
+                    Preconditions.checkArgument(
+                            !hostPart.isEmpty(), "clusterNodes host must not be empty: " + node);
+                    int parsedPort;
+                    try {
+                        parsedPort = Integer.parseInt(portPart);
+                    } catch (NumberFormatException e) {
+                        throw new IllegalArgumentException(
+                                "clusterNodes port must be numeric: " + node, e);
+                    }
+                    Preconditions.checkArgument(
+                            parsedPort > 0 && parsedPort <= 65535,
+                            "clusterNodes port must be in 1..65535: " + node);
+                }
+                Preconditions.checkArgument(
+                        clusterTopologyRefreshPeriodMs > 0,
+                        "clusterTopologyRefreshPeriodMs must be positive");
+            } else {
+                Preconditions.checkNotNull(host, "host must be set");
+                Preconditions.checkArgument(!host.isEmpty(), "host must not be empty");
+                Preconditions.checkArgument(
+                        port > 0 && port <= 65535, "port must be in 1..65535");
+            }
             Preconditions.checkArgument(database >= 0, "database must be non-negative");
             Preconditions.checkNotNull(streamKeys, "streamKeys must be set");
             Preconditions.checkArgument(!streamKeys.isEmpty(), "streamKeys must not be empty");
@@ -275,6 +333,13 @@ public class RedisStreamsSourceConfig implements Serializable {
             Preconditions.checkArgument(pollTimeout > 0, "pollTimeout must be positive");
             Preconditions.checkArgument(
                     maxDeferredAckQueueSize > 0, "maxDeferredAckQueueSize must be positive");
+            Preconditions.checkArgument(
+                    maxDeferredAckQueueSize >= batchSize,
+                    "maxDeferredAckQueueSize ("
+                            + maxDeferredAckQueueSize
+                            + ") must be >= batchSize ("
+                            + batchSize
+                            + ")");
             Preconditions.checkArgument(
                     circuitBreakerFailureThreshold > 0,
                     "circuitBreakerFailureThreshold must be positive");
@@ -298,6 +363,8 @@ public class RedisStreamsSourceConfig implements Serializable {
                     port,
                     password,
                     database,
+                    clusterNodes,
+                    clusterTopologyRefreshPeriodMs,
                     streamKeys,
                     consumerGroup,
                     consumerName,

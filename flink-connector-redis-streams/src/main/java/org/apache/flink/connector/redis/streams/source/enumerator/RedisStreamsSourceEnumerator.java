@@ -31,7 +31,10 @@ import io.lettuce.core.ClientOptions;
 import io.lettuce.core.RedisClient;
 import io.lettuce.core.RedisURI;
 import io.lettuce.core.api.StatefulRedisConnection;
-import io.lettuce.core.api.sync.RedisCommands;
+import io.lettuce.core.cluster.ClusterClientOptions;
+import io.lettuce.core.cluster.RedisClusterClient;
+import io.lettuce.core.cluster.api.StatefulRedisClusterConnection;
+import io.lettuce.core.cluster.api.sync.RedisClusterCommands;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -49,15 +52,8 @@ import java.util.Set;
 import java.util.function.Function;
 
 /**
- * Enumerator for the Redis Streams Source.
- *
- * <p>One split per stream key, distributed round-robin across registered readers. For bounded
- * sources, the stopping entry ID for each stream is captured once at startup via {@code XINFO
- * STREAM} and frozen onto the split — readers stop the split when they consume past it.
- *
- * <p>Synchronization: mutable state is guarded by {@code synchronized(this)}. Calls into the {@link
- * SplitEnumeratorContext} are made <em>outside</em> the lock to avoid deadlocks; the context may
- * dispatch internally.
+ * Enumerator for the Redis Streams Source. One split per stream key, round-robin assignment.
+ * Bounded mode freezes a stopping entry ID per key via {@code XINFO STREAM} at startup.
  */
 @Internal
 public class RedisStreamsSourceEnumerator
@@ -68,26 +64,12 @@ public class RedisStreamsSourceEnumerator
     private final RedisStreamsSourceConfig sourceConfig;
     private final SplitEnumeratorContext<RedisStreamsSourceSplit> context;
 
-    /** Stream keys not yet assigned to a reader. */
+    // SplitEnumerator callbacks are serialized by the SourceCoordinator event loop, so no
+    // synchronization on this state is required.
     private final Set<String> pendingSplitKeys;
-
-    /** Per-reader assignments, for {@code addSplitsBack} accounting. */
     private final Map<Integer, Set<String>> readerAssignments = new HashMap<>();
-
-    /** Readers we've already signaled no-more-splits to (bounded mode only). */
     private final Set<Integer> readersSignaledNoMoreSplits = new HashSet<>();
-
-    /**
-     * Stopping entry IDs per stream key (bounded mode only). Captured once at start; if the stream
-     * does not exist yet, the stopping ID is "0-0" so a fresh stream finishes immediately in
-     * bounded mode (consistent semantics).
-     */
     private final Map<String, String> stoppingEntryIds = new HashMap<>();
-
-    /**
-     * Resolves the latest entry ID for a stream key. In production this opens a Redis connection;
-     * tests can inject a stub.
-     */
     private final Function<String, String> lastGeneratedIdLookup;
 
     public RedisStreamsSourceEnumerator(
@@ -109,6 +91,7 @@ public class RedisStreamsSourceEnumerator
         this.pendingSplitKeys = new HashSet<>();
         if (restoredState != null) {
             this.pendingSplitKeys.addAll(restoredState.getPendingSplits());
+            this.stoppingEntryIds.putAll(restoredState.getStoppingEntryIds());
         } else {
             this.pendingSplitKeys.addAll(sourceConfig.getStreamKeys());
         }
@@ -118,9 +101,10 @@ public class RedisStreamsSourceEnumerator
     public void start() {
         LOG.info("Starting Redis Streams Source Enumerator (bounded={})", sourceConfig.isBounded());
         if (sourceConfig.isBounded()) {
-            // Snapshot stopping IDs once. Readers freeze on these; new entries appended after
-            // job start are NOT consumed by a bounded job.
             for (String streamKey : sourceConfig.getStreamKeys()) {
+                if (stoppingEntryIds.containsKey(streamKey)) {
+                    continue; // restored from checkpoint; do not re-query XINFO.
+                }
                 String stoppingId = lastGeneratedIdLookup.apply(streamKey);
                 stoppingEntryIds.put(streamKey, stoppingId);
                 LOG.info("Bounded mode: stream {} stopping entry id = {}", streamKey, stoppingId);
@@ -138,20 +122,18 @@ public class RedisStreamsSourceEnumerator
     @Override
     public void addSplitsBack(List<RedisStreamsSourceSplit> splits, int subtaskId) {
         LOG.info("Adding {} splits back from reader {}", splits.size(), subtaskId);
-        synchronized (this) {
-            Set<String> assigned = readerAssignments.get(subtaskId);
-            if (assigned != null) {
-                for (RedisStreamsSourceSplit split : splits) {
-                    assigned.remove(split.splitId());
-                }
-                if (assigned.isEmpty()) {
-                    readerAssignments.remove(subtaskId);
-                }
-            }
-            readersSignaledNoMoreSplits.remove(subtaskId);
+        Set<String> assigned = readerAssignments.get(subtaskId);
+        if (assigned != null) {
             for (RedisStreamsSourceSplit split : splits) {
-                pendingSplitKeys.add(split.getStreamKey());
+                assigned.remove(split.splitId());
             }
+            if (assigned.isEmpty()) {
+                readerAssignments.remove(subtaskId);
+            }
+        }
+        readersSignaledNoMoreSplits.remove(subtaskId);
+        for (RedisStreamsSourceSplit split : splits) {
+            pendingSplitKeys.add(split.getStreamKey());
         }
         dispatchAssignments(buildAssignments());
     }
@@ -160,17 +142,10 @@ public class RedisStreamsSourceEnumerator
     public void addReader(int subtaskId) {
         LOG.info("Adding reader {}", subtaskId);
         dispatchAssignments(buildAssignments());
-        boolean shouldSignal;
-        synchronized (this) {
-            shouldSignal =
-                    sourceConfig.isBounded()
-                            && pendingSplitKeys.isEmpty()
-                            && !readersSignaledNoMoreSplits.contains(subtaskId);
-            if (shouldSignal) {
-                readersSignaledNoMoreSplits.add(subtaskId);
-            }
-        }
-        if (shouldSignal) {
+        if (sourceConfig.isBounded()
+                && pendingSplitKeys.isEmpty()
+                && !readersSignaledNoMoreSplits.contains(subtaskId)) {
+            readersSignaledNoMoreSplits.add(subtaskId);
             context.signalNoMoreSplits(subtaskId);
             LOG.info("Signaled no more splits for reader {}", subtaskId);
         }
@@ -179,9 +154,8 @@ public class RedisStreamsSourceEnumerator
     @Override
     public RedisStreamsSourceEnumeratorState snapshotState(long checkpointId) {
         LOG.debug("Snapshotting state for checkpoint {}", checkpointId);
-        synchronized (this) {
-            return new RedisStreamsSourceEnumeratorState(new HashSet<>(pendingSplitKeys));
-        }
+        return new RedisStreamsSourceEnumeratorState(
+                new HashSet<>(pendingSplitKeys), new HashMap<>(stoppingEntryIds));
     }
 
     @Override
@@ -189,34 +163,27 @@ public class RedisStreamsSourceEnumerator
         LOG.info("Closing Redis Streams Source Enumerator");
     }
 
-    /**
-     * Build a snapshot assignment map under the lock, then return it so the caller can dispatch
-     * outside the lock — {@code context.assignSplits} must not be called while holding this lock.
-     */
     private Map<Integer, List<RedisStreamsSourceSplit>> buildAssignments() {
-        Map<Integer, List<RedisStreamsSourceSplit>> assignments;
-        synchronized (this) {
-            if (pendingSplitKeys.isEmpty()) {
-                return Collections.emptyMap();
-            }
-            List<Integer> readers = new ArrayList<>(context.registeredReaders().keySet());
-            if (readers.isEmpty()) {
-                LOG.debug("No readers available for split assignment");
-                return Collections.emptyMap();
-            }
-            assignments = new HashMap<>();
-            int idx = 0;
-            for (String streamKey : new ArrayList<>(pendingSplitKeys)) {
-                int readerId = readers.get(idx % readers.size());
-                String stoppingId =
-                        sourceConfig.isBounded() ? stoppingEntryIds.get(streamKey) : null;
-                RedisStreamsSourceSplit split =
-                        new RedisStreamsSourceSplit(streamKey, null, stoppingId);
-                assignments.computeIfAbsent(readerId, k -> new ArrayList<>()).add(split);
-                readerAssignments.computeIfAbsent(readerId, k -> new HashSet<>()).add(streamKey);
-                pendingSplitKeys.remove(streamKey);
-                idx++;
-            }
+        if (pendingSplitKeys.isEmpty()) {
+            return Collections.emptyMap();
+        }
+        List<Integer> readers = new ArrayList<>(context.registeredReaders().keySet());
+        if (readers.isEmpty()) {
+            LOG.debug("No readers available for split assignment");
+            return Collections.emptyMap();
+        }
+        Map<Integer, List<RedisStreamsSourceSplit>> assignments = new HashMap<>();
+        int idx = 0;
+        for (String streamKey : new ArrayList<>(pendingSplitKeys)) {
+            int readerId = readers.get(idx % readers.size());
+            String stoppingId =
+                    sourceConfig.isBounded() ? stoppingEntryIds.get(streamKey) : null;
+            RedisStreamsSourceSplit split =
+                    new RedisStreamsSourceSplit(streamKey, null, stoppingId);
+            assignments.computeIfAbsent(readerId, k -> new ArrayList<>()).add(split);
+            readerAssignments.computeIfAbsent(readerId, k -> new HashSet<>()).add(streamKey);
+            pendingSplitKeys.remove(streamKey);
+            idx++;
         }
         return assignments;
     }
@@ -228,55 +195,24 @@ public class RedisStreamsSourceEnumerator
             LOG.info("Assigning {} splits to reader {}: {}", splits.size(), readerId, splits);
             context.assignSplits(new SplitsAssignment<>(Map.of(readerId, splits)));
 
-            boolean shouldSignal;
-            synchronized (this) {
-                shouldSignal =
-                        sourceConfig.isBounded()
-                                && pendingSplitKeys.isEmpty()
-                                && !readersSignaledNoMoreSplits.contains(readerId);
-                if (shouldSignal) {
-                    readersSignaledNoMoreSplits.add(readerId);
-                }
-            }
-            if (shouldSignal) {
+            if (sourceConfig.isBounded()
+                    && pendingSplitKeys.isEmpty()
+                    && !readersSignaledNoMoreSplits.contains(readerId)) {
+                readersSignaledNoMoreSplits.add(readerId);
                 context.signalNoMoreSplits(readerId);
                 LOG.info("Signaled no more splits for reader {}", readerId);
             }
         }
     }
 
-    /**
-     * Default lookup that opens a short-lived Lettuce client to read {@code XINFO STREAM <key>}'s
-     * {@code last-generated-id}. Returns {@code "0-0"} if the stream does not exist yet (so a
-     * bounded job over a freshly created stream finishes immediately).
-     */
+    /** Resolves {@code XINFO STREAM <key>}'s {@code last-generated-id}; "0-0" if the stream is missing. */
     private static Function<String, String> defaultLookup(RedisStreamsSourceConfig cfg) {
         return streamKey -> {
-            RedisURI.Builder uriBuilder =
-                    RedisURI.builder()
-                            .withHost(cfg.getHost())
-                            .withPort(cfg.getPort())
-                            .withDatabase(cfg.getDatabase())
-                            .withTimeout(Duration.ofSeconds(5));
-            if (cfg.getPassword() != null && !cfg.getPassword().isEmpty()) {
-                uriBuilder.withPassword(cfg.getPassword().toCharArray());
-            }
-            try (RedisClient client = RedisClient.create(uriBuilder.build())) {
-                client.setOptions(ClientOptions.builder().autoReconnect(false).build());
-                try (StatefulRedisConnection<String, String> conn = client.connect()) {
-                    RedisCommands<String, String> cmds = conn.sync();
-                    try {
-                        List<Object> info = cmds.xinfoStream(streamKey);
-                        return extractLastGeneratedId(info);
-                    } catch (Exception e) {
-                        // Stream does not exist or XINFO failed; bound at 0-0.
-                        LOG.warn(
-                                "Could not read XINFO STREAM for {}; treating as empty. Cause: {}",
-                                streamKey,
-                                e.getMessage());
-                        return "0-0";
-                    }
+            try {
+                if (cfg.isClusterMode()) {
+                    return lookupViaCluster(cfg, streamKey);
                 }
+                return lookupViaStandalone(cfg, streamKey);
             } catch (Exception e) {
                 throw new FlinkRuntimeException(
                         "Failed to query XINFO STREAM for bounded mode setup of " + streamKey, e);
@@ -284,10 +220,56 @@ public class RedisStreamsSourceEnumerator
         };
     }
 
-    /**
-     * Extract {@code last-generated-id} from the {@code XINFO STREAM} response. Lettuce returns a
-     * flat alternating list of {@code key, value, key, value, ...}.
-     */
+    private static String lookupViaStandalone(RedisStreamsSourceConfig cfg, String streamKey) {
+        RedisURI.Builder uriBuilder =
+                RedisURI.builder()
+                        .withHost(cfg.getHost())
+                        .withPort(cfg.getPort())
+                        .withDatabase(cfg.getDatabase())
+                        .withTimeout(Duration.ofSeconds(5));
+        if (cfg.getPassword() != null && !cfg.getPassword().isEmpty()) {
+            uriBuilder.withPassword(cfg.getPassword().toCharArray());
+        }
+        try (RedisClient client = RedisClient.create(uriBuilder.build())) {
+            client.setOptions(ClientOptions.builder().autoReconnect(false).build());
+            try (StatefulRedisConnection<String, String> conn = client.connect()) {
+                return runXinfo(conn.sync(), streamKey);
+            }
+        }
+    }
+
+    private static String lookupViaCluster(RedisStreamsSourceConfig cfg, String streamKey) {
+        List<RedisURI> seeds = new ArrayList<>(cfg.getClusterNodes().size());
+        for (String node : cfg.getClusterNodes()) {
+            int colon = node.lastIndexOf(':');
+            RedisURI.Builder b =
+                    RedisURI.builder()
+                            .withHost(node.substring(0, colon))
+                            .withPort(Integer.parseInt(node.substring(colon + 1)))
+                            .withTimeout(Duration.ofSeconds(5));
+            if (cfg.getPassword() != null && !cfg.getPassword().isEmpty()) {
+                b.withPassword(cfg.getPassword().toCharArray());
+            }
+            seeds.add(b.build());
+        }
+        try (RedisClusterClient client = RedisClusterClient.create(seeds)) {
+            client.setOptions(ClusterClientOptions.builder().autoReconnect(false).build());
+            try (StatefulRedisClusterConnection<String, String> conn = client.connect()) {
+                return runXinfo(conn.sync(), streamKey);
+            }
+        }
+    }
+
+    private static String runXinfo(RedisClusterCommands<String, String> cmds, String streamKey) {
+        try {
+            return extractLastGeneratedId(cmds.xinfoStream(streamKey));
+        } catch (Exception e) {
+            LOG.warn("Could not read XINFO STREAM for {}; treating as empty: {}", streamKey, e.getMessage());
+            return "0-0";
+        }
+    }
+
+    /** Extract {@code last-generated-id} from the alternating key/value {@code XINFO STREAM} list. */
     @VisibleForTesting
     static String extractLastGeneratedId(List<Object> info) {
         if (info == null) {

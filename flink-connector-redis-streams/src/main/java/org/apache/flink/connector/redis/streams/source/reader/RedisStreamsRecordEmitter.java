@@ -50,25 +50,15 @@ public class RedisStreamsRecordEmitter<T>
             T record =
                     deserializationSchema.deserialize(
                             element.getStream(), element.getId(), element.getBody());
-
-            // Always advance the split offset regardless of whether the record is null
-            // (filtered). Failing to do so causes null-filtered messages to remain in the PEL
-            // indefinitely — they will be re-delivered on every recovery and re-filtered,
-            // creating unbounded PEL growth.
+            // Null records are filter results, not failures, and must still be
+            // ACKed so they don't grow the PEL forever.
             splitState.setCurrentEntryId(element.getId());
-
             if (record != null) {
                 output.collect(record);
-                LOG.debug(
-                        "Emitted record from split {} with entry ID {}",
-                        splitState.getStreamKey(),
-                        element.getId());
-            } else {
-                LOG.debug("Deserialization returned null for entry ID {}", element.getId());
             }
         } catch (Exception e) {
             LOG.error(
-                    "Failed to deserialize record from stream {} with ID {}",
+                    "Failed to deserialize record from stream {} id {}",
                     element.getStream(),
                     element.getId(),
                     e);

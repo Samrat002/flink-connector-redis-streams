@@ -27,6 +27,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Stream;
 
@@ -45,7 +46,7 @@ class RedisStreamsSourceEnumeratorStateTest {
 
     @ParameterizedTest
     @MethodSource("roundTripCases")
-    void serializationRoundTripV2(Set<String> pending) throws IOException {
+    void serializationRoundTripV3PendingOnly(Set<String> pending) throws IOException {
         RedisStreamsSourceEnumeratorState state = new RedisStreamsSourceEnumeratorState(pending);
         byte[] bytes = RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.serialize(state);
         RedisStreamsSourceEnumeratorState restored =
@@ -53,14 +54,31 @@ class RedisStreamsSourceEnumeratorStateTest {
                         RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.getVersion(), bytes);
 
         assertThat(restored.getPendingSplits()).isEqualTo(pending);
+        assertThat(restored.getStoppingEntryIds()).isEmpty();
     }
 
     @Test
-    void v1PayloadDiscardsLegacyDiscoveredKeys() throws IOException {
+    void serializationRoundTripV3PreservesStoppingEntryIds() throws IOException {
+        Set<String> pending = Set.of("stream-a");
+        Map<String, String> stoppingIds =
+                Map.of("stream-a", "100-0", "stream-b", "9999-7", "stream-c", "0-0");
+        RedisStreamsSourceEnumeratorState state =
+                new RedisStreamsSourceEnumeratorState(new HashSet<>(pending), stoppingIds);
+
+        byte[] bytes = RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.serialize(state);
+        RedisStreamsSourceEnumeratorState restored =
+                RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.deserialize(
+                        RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.getVersion(), bytes);
+
+        assertThat(restored.getPendingSplits()).containsExactlyElementsOf(pending);
+        assertThat(restored.getStoppingEntryIds()).isEqualTo(stoppingIds);
+    }
+
+    @Test
+    void v1PayloadDiscardsLegacyDiscoveredKeysAndYieldsEmptyStoppingMap() throws IOException {
         DataOutputSerializer out = new DataOutputSerializer(64);
         out.writeInt(1);
         out.writeUTF("active");
-        // legacy "discoveredStreamKeys" field — must be read and discarded
         out.writeInt(2);
         out.writeUTF("active");
         out.writeUTF("discovered-but-unused");
@@ -70,6 +88,22 @@ class RedisStreamsSourceEnumeratorStateTest {
                         1, out.getCopyOfBuffer());
 
         assertThat(restored.getPendingSplits()).containsExactly("active");
+        assertThat(restored.getStoppingEntryIds()).isEmpty();
+    }
+
+    @Test
+    void v2PayloadYieldsEmptyStoppingMap() throws IOException {
+        DataOutputSerializer out = new DataOutputSerializer(64);
+        out.writeInt(2);
+        out.writeUTF("k1");
+        out.writeUTF("k2");
+
+        RedisStreamsSourceEnumeratorState restored =
+                RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.deserialize(
+                        2, out.getCopyOfBuffer());
+
+        assertThat(restored.getPendingSplits()).containsExactlyInAnyOrder("k1", "k2");
+        assertThat(restored.getStoppingEntryIds()).isEmpty();
     }
 
     @Test

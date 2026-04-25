@@ -26,16 +26,8 @@ import org.apache.flink.core.memory.DataOutputSerializer;
 import java.io.IOException;
 
 /**
- * Binary serializer for {@link RedisStreamsSourceSplit}.
- *
- * <p>Version history:
- *
- * <ul>
- *   <li>Version 1: {@code streamKey}, {@code lastReadEntryId}.
- *   <li>Version 2 (current): {@code streamKey}, {@code startingEntryId}, {@code stoppingEntryId}.
- *       {@code lastReadEntryId} from v1 is migrated to {@code startingEntryId}; {@code
- *       stoppingEntryId} defaults to {@code null} (unbounded) on restore.
- * </ul>
+ * Binary serializer for {@link RedisStreamsSourceSplit}. v1 contained {@code lastReadEntryId};
+ * v2 splits it into {@code startingEntryId} + {@code stoppingEntryId} and migrates v1 payloads.
  */
 @Internal
 public final class RedisStreamsSourceSplitSerializer

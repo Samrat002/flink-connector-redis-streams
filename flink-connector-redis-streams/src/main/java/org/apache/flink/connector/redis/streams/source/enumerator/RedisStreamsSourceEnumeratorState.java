@@ -20,27 +20,34 @@ package org.apache.flink.connector.redis.streams.source.enumerator;
 
 import org.apache.flink.annotation.Internal;
 
+import java.util.Collections;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-/**
- * Checkpointed state of the Redis Streams Source Enumerator.
- *
- * <p>Contains only {@code pendingSplits} — stream keys that have been discovered but not yet
- * assigned to a reader. Stream keys that are already assigned are tracked by the readers themselves
- * and do not need to be snapshotted here.
- */
+/** Checkpointed enumerator state: unassigned stream keys + frozen bounded-mode stopping IDs. */
 @Internal
 public class RedisStreamsSourceEnumeratorState {
 
     private final Set<String> pendingSplits;
+    private final Map<String, String> stoppingEntryIds;
 
     public RedisStreamsSourceEnumeratorState(Set<String> pendingSplits) {
+        this(pendingSplits, Collections.emptyMap());
+    }
+
+    public RedisStreamsSourceEnumeratorState(
+            Set<String> pendingSplits, Map<String, String> stoppingEntryIds) {
         this.pendingSplits = Objects.requireNonNull(pendingSplits);
+        this.stoppingEntryIds = Objects.requireNonNull(stoppingEntryIds);
     }
 
     public Set<String> getPendingSplits() {
         return pendingSplits;
+    }
+
+    public Map<String, String> getStoppingEntryIds() {
+        return stoppingEntryIds;
     }
 
     @Override
@@ -52,11 +59,12 @@ public class RedisStreamsSourceEnumeratorState {
             return false;
         }
         RedisStreamsSourceEnumeratorState that = (RedisStreamsSourceEnumeratorState) o;
-        return Objects.equals(pendingSplits, that.pendingSplits);
+        return Objects.equals(pendingSplits, that.pendingSplits)
+                && Objects.equals(stoppingEntryIds, that.stoppingEntryIds);
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(pendingSplits);
+        return Objects.hash(pendingSplits, stoppingEntryIds);
     }
 }

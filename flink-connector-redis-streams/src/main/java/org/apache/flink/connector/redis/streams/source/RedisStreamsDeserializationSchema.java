@@ -24,54 +24,12 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import java.io.Serializable;
 import java.util.Map;
 
-/**
- * Deserialization schema for Redis Stream entries.
- *
- * <p>This interface defines how Redis Stream entries (field-value pairs) are converted into records
- * of type {@code T}. Implementations must be {@link Serializable} to support distributed
- * processing.
- *
- * <p>Example implementation:
- *
- * <pre>{@code
- * public class MyDeserializer implements RedisStreamsDeserializationSchema<MyPojo> {
- *     @Override
- *     public MyPojo deserialize(String streamKey, String entryId, Map<String, String> fields) {
- *         return new MyPojo(
- *             fields.get("field1"),
- *             fields.get("field2")
- *         );
- *     }
- *
- *     @Override
- *     public TypeInformation<MyPojo> getProducedType() {
- *         return TypeInformation.of(MyPojo.class);
- *     }
- * }
- * }</pre>
- *
- * <p>This interface is part of the Public API and is stable across versions.
- *
- * @param <T> The type of the deserialized record
- */
+/** Converts a Redis Stream entry into a record of type {@code T}. */
 @PublicEvolving
 public interface RedisStreamsDeserializationSchema<T> extends Serializable {
 
-    /**
-     * Deserializes a Redis Stream entry into a record.
-     *
-     * @param streamKey The Redis Stream key from which this entry was read
-     * @param entryId The unique entry ID in the stream (format: "timestamp-sequence")
-     * @param fields The field-value pairs in the stream entry (Redis Stream message body)
-     * @return The deserialized record
-     * @throws Exception If deserialization fails
-     */
+    /** Returning {@code null} drops the record (still ACKed). */
     T deserialize(String streamKey, String entryId, Map<String, String> fields) throws Exception;
 
-    /**
-     * Gets the type information for the produced type.
-     *
-     * @return The type information for type {@code T}
-     */
     TypeInformation<T> getProducedType();
 }

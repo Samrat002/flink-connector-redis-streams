@@ -25,20 +25,11 @@ import javax.annotation.Nullable;
 
 import java.util.Objects;
 
-/**
- * Mutable runtime state for a {@link RedisStreamsSourceSplit}.
- *
- * <p>Holds the last entry ID emitted by the {@link
- * org.apache.flink.connector.redis.streams.source.reader.RedisStreamsRecordEmitter} so that, on
- * checkpoint, the snapshotted {@link RedisStreamsSourceSplit#getStartingEntryId()} reflects the
- * latest progress and survives restore.
- */
+/** Mutable per-split state — the latest entry ID emitted by the record emitter. */
 @Internal
 public class RedisStreamsSourceSplitState {
 
     private final RedisStreamsSourceSplit split;
-
-    /** The latest entry ID consumed by the record emitter; null until the first record. */
     @Nullable private String currentEntryId;
 
     public RedisStreamsSourceSplitState(RedisStreamsSourceSplit split) {
@@ -59,10 +50,6 @@ public class RedisStreamsSourceSplitState {
         this.currentEntryId = currentEntryId;
     }
 
-    /**
-     * Snapshot the current state back into an immutable split. Preserves identity and stopping
-     * bound while advancing the starting position to the latest consumed ID.
-     */
     public RedisStreamsSourceSplit toSplit() {
         return new RedisStreamsSourceSplit(
                 split.getStreamKey(), currentEntryId, split.getStoppingEntryId());

@@ -181,8 +181,60 @@ class RedisStreamsSourceEnumeratorTest {
     }
 
     @Test
+    void boundedRestoreUsesCheckpointedStoppingIdsInsteadOfReQueryingXinfo() {
+        TestingSplitEnumeratorContext<RedisStreamsSourceSplit> ctx =
+                new TestingSplitEnumeratorContext<>(1);
+        ctx.registerReader(0, "host-0");
+
+        RedisStreamsSourceEnumeratorState restored =
+                new RedisStreamsSourceEnumeratorState(
+                        new HashSet<>(Set.of("a")), Map.of("a", "100-0"));
+
+        java.util.concurrent.atomic.AtomicInteger lookupCalls =
+                new java.util.concurrent.atomic.AtomicInteger(0);
+        Function<String, String> shiftedLookup =
+                key -> {
+                    lookupCalls.incrementAndGet();
+                    return "9999-0";
+                };
+
+        RedisStreamsSourceEnumerator enumerator =
+                new RedisStreamsSourceEnumerator(cfg(true, "a"), ctx, restored, shiftedLookup);
+        enumerator.start();
+        enumerator.addReader(0);
+
+        List<RedisStreamsSourceSplit> assigned = assignedSplits(ctx, 0);
+        assertThat(assigned).hasSize(1);
+        assertThat(assigned.get(0).getStoppingEntryId()).isEqualTo("100-0");
+        assertThat(lookupCalls.get()).isZero();
+        assertThat(enumerator.snapshotState(7L).getStoppingEntryIds())
+                .containsEntry("a", "100-0");
+    }
+
+    @Test
+    void boundedRestoreLooksUpStoppingIdForKeysMissingFromRestoredMap() {
+        TestingSplitEnumeratorContext<RedisStreamsSourceSplit> ctx =
+                new TestingSplitEnumeratorContext<>(1);
+        ctx.registerReader(0, "host-0");
+
+        RedisStreamsSourceEnumeratorState legacy =
+                new RedisStreamsSourceEnumeratorState(new HashSet<>(Set.of("a")));
+
+        RedisStreamsSourceEnumerator enumerator =
+                new RedisStreamsSourceEnumerator(
+                        cfg(true, "a"), ctx, legacy, key -> "42-0");
+        enumerator.start();
+        enumerator.addReader(0);
+
+        List<RedisStreamsSourceSplit> assigned = assignedSplits(ctx, 0);
+        assertThat(assigned).hasSize(1);
+        assertThat(assigned.get(0).getStoppingEntryId()).isEqualTo("42-0");
+        assertThat(enumerator.snapshotState(1L).getStoppingEntryIds())
+                .containsEntry("a", "42-0");
+    }
+
+    @Test
     void extractLastGeneratedIdParsesAlternatingList() {
-        // XINFO STREAM returns alternating key,value pairs.
         List<Object> info =
                 List.of("length", 3L, "last-generated-id", "12345-0", "first-entry", "X");
         assertThat(RedisStreamsSourceEnumerator.extractLastGeneratedId(info)).isEqualTo("12345-0");

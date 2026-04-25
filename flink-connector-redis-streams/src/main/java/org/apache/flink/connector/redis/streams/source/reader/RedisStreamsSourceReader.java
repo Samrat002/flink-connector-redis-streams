@@ -86,26 +86,20 @@ public class RedisStreamsSourceReader<T>
     @Override
     public List<RedisStreamsSourceSplit> snapshotState(long checkpointId) {
         List<RedisStreamsSourceSplit> splits = super.snapshotState(checkpointId);
-
         RedisStreamsSplitReader reader = splitReaderRef.get();
         if (reader != null) {
             reader.markCheckpoint(checkpointId);
         }
-
-        LOG.debug("Snapshotting state for checkpoint {}: {} splits", checkpointId, splits.size());
         return splits;
     }
 
     @Override
     public void notifyCheckpointComplete(long checkpointId) throws Exception {
         super.notifyCheckpointComplete(checkpointId);
-
         RedisStreamsSplitReader reader = splitReaderRef.get();
         if (reader != null) {
             reader.acknowledgeAllPendingMessagesAtCheckpoint(checkpointId);
         }
-
-        LOG.debug("Checkpoint {} completed with message acknowledgements", checkpointId);
     }
 
     @Override

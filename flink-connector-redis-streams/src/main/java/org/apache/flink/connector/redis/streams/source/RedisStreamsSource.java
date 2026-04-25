@@ -48,28 +48,18 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * Flink Source for Redis Streams.
- *
- * <p>This source supports both bounded and unbounded modes, providing at-least-once processing
- * guarantees through Redis consumer groups and Flink checkpointing. Messages are acknowledged only
- * after a checkpoint completes, ensuring no data loss on failure.
- *
- * <p>Example usage:
+ * Flink Source for Redis Streams. Provides at-least-once delivery via Redis consumer groups and
+ * checkpoint-aligned XACK.
  *
  * <pre>{@code
  * RedisStreamsSource<Map<String, String>> source =
  *     RedisStreamsSource.<Map<String, String>>builder()
- *         .setHost("localhost")
- *         .setPort(6379)
+ *         .setHost("localhost").setPort(6379)
  *         .setStreamKeys(List.of("my-stream"))
  *         .setConsumerGroup("flink-consumer-group")
  *         .setDeserializationSchema(new SimpleMapDeserializationSchema())
  *         .build();
- *
- * env.fromSource(source, WatermarkStrategy.noWatermarks(), "Redis Streams Source");
  * }</pre>
- *
- * @param <T> The type of records produced by this source
  */
 @PublicEvolving
 public class RedisStreamsSource<T>
@@ -156,10 +146,7 @@ public class RedisStreamsSource<T>
         return new RedisStreamsSourceBuilder<>();
     }
 
-    /**
-     * Builder for {@link RedisStreamsSource}. Delegates configuration to {@link
-     * RedisStreamsSourceConfig.Builder} to avoid field duplication.
-     */
+    /** Builder for {@link RedisStreamsSource}. */
     @PublicEvolving
     public static class RedisStreamsSourceBuilder<T> {
         private final RedisStreamsSourceConfig.Builder configBuilder =
@@ -173,6 +160,17 @@ public class RedisStreamsSource<T>
 
         public RedisStreamsSourceBuilder<T> setPort(int port) {
             configBuilder.setPort(port);
+            return this;
+        }
+
+        /** Activate cluster mode with one or more {@code host:port} seeds. */
+        public RedisStreamsSourceBuilder<T> setClusterNodes(List<String> clusterNodes) {
+            configBuilder.setClusterNodes(clusterNodes);
+            return this;
+        }
+
+        public RedisStreamsSourceBuilder<T> setClusterTopologyRefreshPeriodMs(long periodMs) {
+            configBuilder.setClusterTopologyRefreshPeriodMs(periodMs);
             return this;
         }
 

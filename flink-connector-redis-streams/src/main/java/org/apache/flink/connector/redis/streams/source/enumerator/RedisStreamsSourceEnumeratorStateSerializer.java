@@ -24,21 +24,14 @@ import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 /**
- * Binary serializer for {@link RedisStreamsSourceEnumeratorState}.
- *
- * <p>Version history:
- *
- * <ul>
- *   <li>Version 1: serialized {@code pendingSplits} + {@code discoveredStreamKeys}. {@code
- *       discoveredStreamKeys} was dead state (dynamic discovery was never implemented) and has been
- *       removed.
- *   <li>Version 2 (current): serializes only {@code pendingSplits}. Version 1 checkpoints are read
- *       correctly — the {@code discoveredStreamKeys} field is consumed and discarded.
- * </ul>
+ * Binary serializer for {@link RedisStreamsSourceEnumeratorState}. v1: pending +
+ * discoveredStreamKeys (legacy, dropped). v2: pending only. v3: pending + stoppingEntryIds.
  */
 @Internal
 public class RedisStreamsSourceEnumeratorStateSerializer
@@ -47,7 +40,7 @@ public class RedisStreamsSourceEnumeratorStateSerializer
     public static final RedisStreamsSourceEnumeratorStateSerializer INSTANCE =
             new RedisStreamsSourceEnumeratorStateSerializer();
 
-    public static final int CURRENT_VERSION = 2;
+    public static final int CURRENT_VERSION = 3;
 
     private static final int SERIALIZER_INITIAL_CAPACITY = 128;
 
@@ -66,6 +59,12 @@ public class RedisStreamsSourceEnumeratorStateSerializer
         for (String split : pendingSplits) {
             out.writeUTF(split);
         }
+        Map<String, String> stoppingEntryIds = state.getStoppingEntryIds();
+        out.writeInt(stoppingEntryIds.size());
+        for (Map.Entry<String, String> e : stoppingEntryIds.entrySet()) {
+            out.writeUTF(e.getKey());
+            out.writeUTF(e.getValue());
+        }
         return out.getCopyOfBuffer();
     }
 
@@ -81,16 +80,25 @@ public class RedisStreamsSourceEnumeratorStateSerializer
         }
 
         if (version == 1) {
-            // Version 1 had a discoveredStreamKeys field that is now removed.
-            // Read and discard it for backward compatibility.
             int discoveredSize = in.readInt();
             for (int i = 0; i < discoveredSize; i++) {
                 in.readUTF();
             }
-        } else if (version != CURRENT_VERSION) {
-            throw new IOException("Unsupported serializer version: " + version);
+            return new RedisStreamsSourceEnumeratorState(pendingSplits);
         }
-
-        return new RedisStreamsSourceEnumeratorState(pendingSplits);
+        if (version == 2) {
+            return new RedisStreamsSourceEnumeratorState(pendingSplits);
+        }
+        if (version == CURRENT_VERSION) {
+            int stoppingSize = in.readInt();
+            Map<String, String> stoppingEntryIds = new HashMap<>(stoppingSize);
+            for (int i = 0; i < stoppingSize; i++) {
+                String key = in.readUTF();
+                String value = in.readUTF();
+                stoppingEntryIds.put(key, value);
+            }
+            return new RedisStreamsSourceEnumeratorState(pendingSplits, stoppingEntryIds);
+        }
+        throw new IOException("Unsupported serializer version: " + version);
     }
 }

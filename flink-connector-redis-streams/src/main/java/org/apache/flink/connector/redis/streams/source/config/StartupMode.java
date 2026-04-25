@@ -21,27 +21,11 @@ package org.apache.flink.connector.redis.streams.source.config;
 import org.apache.flink.annotation.PublicEvolving;
 
 /**
- * Startup mode for the Redis Streams source when a consumer group does not yet exist.
- *
- * <p>Once the consumer group exists (BUSYGROUP), Redis tracks position server-side and this setting
- * has no effect — the connector resumes from wherever the group left off.
+ * Startup position used only when the consumer group is created (BUSYGROUP otherwise resumes from
+ * the group's existing position). {@code EARLIEST} = {@code 0-0}; {@code LATEST} = {@code $}.
  */
 @PublicEvolving
 public enum StartupMode {
-
-    /**
-     * Start from the beginning of the stream (Redis offset {@code 0-0}).
-     *
-     * <p>Use when you need to process the full stream history on first deployment.
-     */
     EARLIEST,
-
-    /**
-     * Start from the latest entry at the time the consumer group is created (Redis offset {@code
-     * $}).
-     *
-     * <p>This is the default. Use when you only care about new messages and do not need to replay
-     * history.
-     */
     LATEST
 }

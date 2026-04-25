@@ -71,7 +71,7 @@ class RedisStreamsSourceConfigTest {
                         .setPollTimeout(500)
                         .setBatchSize(64)
                         .setStartupMode(StartupMode.EARLIEST)
-                        .setMaxDeferredAckQueueSize(50)
+                        .setMaxDeferredAckQueueSize(500)
                         .setCircuitBreakerFailureThreshold(2)
                         .setCircuitBreakerOpenDurationMs(1234L)
                         .build();
@@ -87,9 +87,122 @@ class RedisStreamsSourceConfigTest {
         assertThat(config.getPollTimeout()).isEqualTo(500);
         assertThat(config.getBatchSize()).isEqualTo(64);
         assertThat(config.getStartupMode()).isEqualTo(StartupMode.EARLIEST);
-        assertThat(config.getMaxDeferredAckQueueSize()).isEqualTo(50);
+        assertThat(config.getMaxDeferredAckQueueSize()).isEqualTo(500);
         assertThat(config.getCircuitBreakerFailureThreshold()).isEqualTo(2);
         assertThat(config.getCircuitBreakerOpenDurationMs()).isEqualTo(1234L);
+    }
+
+    @Test
+    void clusterModeIsActiveWhenClusterNodesSet() {
+        RedisStreamsSourceConfig config =
+                RedisStreamsSourceConfig.builder()
+                        .setStreamKeys(List.of("s"))
+                        .setClusterNodes(List.of("node-a:7000", "node-b:7001", "node-c:7002"))
+                        .setClusterTopologyRefreshPeriodMs(15_000L)
+                        .build();
+
+        assertThat(config.isClusterMode()).isTrue();
+        assertThat(config.getClusterNodes())
+                .containsExactly("node-a:7000", "node-b:7001", "node-c:7002");
+        assertThat(config.getClusterTopologyRefreshPeriodMs()).isEqualTo(15_000L);
+    }
+
+    @Test
+    void standaloneModeWhenClusterNodesEmpty() {
+        RedisStreamsSourceConfig config =
+                RedisStreamsSourceConfig.builder().setStreamKeys(List.of("s")).build();
+
+        assertThat(config.isClusterMode()).isFalse();
+        assertThat(config.getClusterNodes()).isEmpty();
+    }
+
+    @Test
+    void clusterNodesListIsImmutable() {
+        java.util.List<String> mutable =
+                new java.util.ArrayList<>(List.of("node-a:7000"));
+        RedisStreamsSourceConfig config =
+                RedisStreamsSourceConfig.builder()
+                        .setStreamKeys(List.of("s"))
+                        .setClusterNodes(mutable)
+                        .build();
+
+        mutable.add("mutated:7777");
+        assertThat(config.getClusterNodes()).containsExactly("node-a:7000");
+        assertThatThrownBy(() -> config.getClusterNodes().add("z:1"))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void clusterModeRejectsMalformedNodes() {
+        // missing port
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of("node-a"))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+        // empty host
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of(":7000"))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+        // empty port
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of("node-a:"))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+        // non-numeric port
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of("node-a:abc"))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+        // out-of-range port
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of("node-a:99999"))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+        // null entry
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(Arrays.asList("node-a:7000", null))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+        // non-positive refresh period
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of("node-a:7000"))
+                                        .setClusterTopologyRefreshPeriodMs(0L)
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void clusterModeBypassesStandaloneHostValidation() {
+        // host="" would fail in standalone mode but is irrelevant in cluster mode.
+        RedisStreamsSourceConfig config =
+                RedisStreamsSourceConfig.builder()
+                        .setHost("")
+                        .setStreamKeys(List.of("s"))
+                        .setClusterNodes(List.of("node-a:7000"))
+                        .build();
+        assertThat(config.isClusterMode()).isTrue();
     }
 
     @Test
@@ -193,5 +306,28 @@ class RedisStreamsSourceConfigTest {
                                         .setStreamKeys(List.of("s"))
                                         .build())
                 .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void validationRejectsMaxDeferredAckQueueSizeSmallerThanBatchSize() {
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setBatchSize(100)
+                                        .setMaxDeferredAckQueueSize(50)
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("maxDeferredAckQueueSize")
+                .hasMessageContaining(">= batchSize");
+
+        RedisStreamsSourceConfig accepted =
+                RedisStreamsSourceConfig.builder()
+                        .setStreamKeys(List.of("s"))
+                        .setBatchSize(100)
+                        .setMaxDeferredAckQueueSize(100)
+                        .build();
+        assertThat(accepted.getBatchSize()).isEqualTo(100);
+        assertThat(accepted.getMaxDeferredAckQueueSize()).isEqualTo(100);
     }
 }
