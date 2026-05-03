@@ -19,17 +19,44 @@
 package org.apache.flink.connector.redis.streams.source;
 
 import org.apache.flink.annotation.PublicEvolving;
+import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.java.typeutils.ResultTypeQueryable;
 
+import java.io.IOException;
 import java.io.Serializable;
 import java.util.Map;
 
-/** Converts a Redis Stream entry into a record of type {@code T}. */
+/**
+ * Converts a Redis Stream entry into a record of type {@code T}.
+ *
+ * <p>Returning {@code null} from {@link #deserialize} drops the record — the entry is still
+ * XACKed so it does not re-appear in the PEL. Throwing {@link IOException} fails the task and
+ * triggers a restart, replaying the entry via PEL recovery.
+ *
+ * <p>If the schema needs initialisation (opening a connection, reading a side-input, etc.) override
+ * {@link #open(DeserializationSchema.InitializationContext)} — it is called exactly once after the
+ * schema is deserialized on the TaskManager, before the first {@link #deserialize} call.
+ */
 @PublicEvolving
-public interface RedisStreamsDeserializationSchema<T> extends Serializable {
+public interface RedisStreamsDeserializationSchema<T>
+        extends Serializable, ResultTypeQueryable<T> {
 
-    /** Returning {@code null} drops the record (still ACKed). */
-    T deserialize(String streamKey, String entryId, Map<String, String> fields) throws Exception;
+    /**
+     * Called once when the schema is instantiated on the TaskManager. Override to open resources,
+     * connections, or side-inputs needed during deserialization.
+     */
+    default void open(DeserializationSchema.InitializationContext context) throws Exception {}
 
+    /**
+     * Deserializes a Redis Stream entry.
+     *
+     * @return the deserialized record, or {@code null} to drop the entry silently (still XACKed).
+     * @throws IOException if deserialization fails; the task will restart and the entry will be
+     *     re-delivered via PEL recovery.
+     */
+    T deserialize(String streamKey, String entryId, Map<String, String> fields) throws IOException;
+
+    @Override
     TypeInformation<T> getProducedType();
 }

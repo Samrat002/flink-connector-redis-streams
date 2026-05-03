@@ -26,8 +26,14 @@ import org.apache.flink.core.memory.DataOutputSerializer;
 import java.io.IOException;
 
 /**
- * Binary serializer for {@link RedisStreamsSourceSplit}. v1 contained {@code lastReadEntryId};
- * v2 splits it into {@code startingEntryId} + {@code stoppingEntryId} and migrates v1 payloads.
+ * Binary serializer for {@link RedisStreamsSourceSplit}.
+ *
+ * <p>Format (v1): {@code streamKey (UTF) | startingEntryId (nullable UTF) | stoppingEntryId
+ * (nullable UTF)}. Each nullable field is written as a boolean presence flag followed by the UTF
+ * string when present.
+ *
+ * <p>When the wire format changes in future releases, bump {@link #CURRENT_VERSION} and add a
+ * migration case to {@link #deserialize(int, byte[])}.
  */
 @Internal
 public final class RedisStreamsSourceSplitSerializer
@@ -36,7 +42,8 @@ public final class RedisStreamsSourceSplitSerializer
     public static final RedisStreamsSourceSplitSerializer INSTANCE =
             new RedisStreamsSourceSplitSerializer();
 
-    public static final int CURRENT_VERSION = 2;
+    /** Current serialization format version. Bump when the binary layout changes post-release. */
+    private static final int CURRENT_VERSION = 1;
 
     private static final int SERIALIZER_INITIAL_CAPACITY = 256;
 
@@ -58,24 +65,18 @@ public final class RedisStreamsSourceSplitSerializer
 
     @Override
     public RedisStreamsSourceSplit deserialize(int version, byte[] serialized) throws IOException {
-        DataInputDeserializer in = new DataInputDeserializer(serialized);
-        switch (version) {
-            case 1:
-                {
-                    String streamKey = in.readUTF();
-                    String lastReadEntryId = readNullable(in);
-                    return new RedisStreamsSourceSplit(streamKey, lastReadEntryId, null);
-                }
-            case CURRENT_VERSION:
-                {
-                    String streamKey = in.readUTF();
-                    String startingEntryId = readNullable(in);
-                    String stoppingEntryId = readNullable(in);
-                    return new RedisStreamsSourceSplit(streamKey, startingEntryId, stoppingEntryId);
-                }
-            default:
-                throw new IOException("Unsupported serializer version: " + version);
+        if (version != CURRENT_VERSION) {
+            throw new IOException(
+                    "Unsupported serializer version: "
+                            + version
+                            + ". This connector has not been released yet; "
+                            + "please start fresh (no migration path from development snapshots).");
         }
+        DataInputDeserializer in = new DataInputDeserializer(serialized);
+        String streamKey = in.readUTF();
+        String startingEntryId = readNullable(in);
+        String stoppingEntryId = readNullable(in);
+        return new RedisStreamsSourceSplit(streamKey, startingEntryId, stoppingEntryId);
     }
 
     private static void writeNullable(DataOutputSerializer out, String value) throws IOException {

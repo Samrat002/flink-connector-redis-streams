@@ -79,7 +79,7 @@ class RedisStreamsSourceSplitTest {
 
     @ParameterizedTest
     @MethodSource("serializationCases")
-    void roundTripV2(String key, String start, String stop) throws IOException {
+    void roundTripV1(String key, String start, String stop) throws IOException {
         RedisStreamsSourceSplitSerializer serializer = RedisStreamsSourceSplitSerializer.INSTANCE;
         RedisStreamsSourceSplit original = new RedisStreamsSourceSplit(key, start, stop);
 
@@ -92,27 +92,8 @@ class RedisStreamsSourceSplitTest {
     }
 
     @Test
-    void v1PayloadIsMigratedToV2() throws IOException {
-        // Version 1 layout: streamKey (UTF), boolean hasLastReadEntryId, [optional UTF].
-        DataOutputSerializer out = new DataOutputSerializer(64);
-        out.writeUTF("legacy-stream");
-        out.writeBoolean(true);
-        out.writeUTF("123-4");
-
-        RedisStreamsSourceSplit restored =
-                RedisStreamsSourceSplitSerializer.INSTANCE.deserialize(1, out.getCopyOfBuffer());
-
-        assertThat(restored.getStreamKey()).isEqualTo("legacy-stream");
-        assertThat(restored.getStartingEntryId())
-                .as("v1 lastReadEntryId migrates to v2 startingEntryId")
-                .isEqualTo("123-4");
-        assertThat(restored.getStoppingEntryId())
-                .as("v1 had no bound; defaults to unbounded")
-                .isNull();
-    }
-
-    @Test
-    void unsupportedVersionRejected() {
+    void unknownVersionRejected() {
+        // Any version other than CURRENT_VERSION (1) must be rejected cleanly.
         assertThatThrownBy(
                         () ->
                                 RedisStreamsSourceSplitSerializer.INSTANCE.deserialize(

@@ -18,6 +18,7 @@
 package org.apache.flink.connector.redis.streams.source.reader;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.serialization.DeserializationSchema;
 import org.apache.flink.api.connector.source.SourceReaderContext;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.connector.base.source.reader.SingleThreadMultiplexSourceReaderBase;
@@ -26,17 +27,35 @@ import org.apache.flink.connector.redis.streams.source.RedisStreamsDeserializati
 import org.apache.flink.connector.redis.streams.source.reader.split.RedisStreamsSplitReader;
 import org.apache.flink.connector.redis.streams.source.split.RedisStreamsSourceSplit;
 import org.apache.flink.connector.redis.streams.source.split.RedisStreamsSourceSplitState;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
+import org.apache.flink.util.UserCodeClassLoader;
 
 import io.lettuce.core.StreamMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Source reader for Redis Streams. */
+/**
+ * Source reader for Redis Streams.
+ *
+ * <p>The reader owns the deferred-XACK lifecycle:
+ *
+ * <ol>
+ *   <li>{@link RedisStreamsRecordEmitter} registers each emitted entry ID in the split state's
+ *       deferred-ACK queue (task main thread).
+ *   <li>{@link #snapshotState} drains those IDs from all active split states and hands them to
+ *       {@link RedisStreamsSplitReader#markCheckpoint} — only IDs that crossed the barrier are
+ *       eligible for XACK.
+ *   <li>{@link #notifyCheckpointComplete} triggers the actual XACK.
+ *   <li>{@link #notifyCheckpointAborted} discards the snapshot so back-pressure is released.
+ * </ol>
+ */
 @Internal
 public class RedisStreamsSourceReader<T>
         extends SingleThreadMultiplexSourceReaderBase<
@@ -47,7 +66,16 @@ public class RedisStreamsSourceReader<T>
 
     private static final Logger LOG = LoggerFactory.getLogger(RedisStreamsSourceReader.class);
 
+    private final RedisStreamsDeserializationSchema<T> deserializationSchema;
+    private final SourceReaderContext context;
     private final AtomicReference<RedisStreamsSplitReader> splitReaderRef;
+
+    /**
+     * Tracks all active split states so {@link #snapshotState} can drain their deferred-ACK queues
+     * without accessing {@code SourceReaderBase}'s private {@code splitStates} field. Maintained
+     * exclusively on the task main thread — no synchronisation required.
+     */
+    private final Map<String, RedisStreamsSourceSplitState> activeSplitStates = new HashMap<>();
 
     public RedisStreamsSourceReader(
             SingleThreadFetcherManager<StreamMessage<String, String>, RedisStreamsSourceSplit>
@@ -61,6 +89,8 @@ public class RedisStreamsSourceReader<T>
                 new RedisStreamsRecordEmitter<>(deserializationSchema),
                 config,
                 context);
+        this.deserializationSchema = Preconditions.checkNotNull(deserializationSchema);
+        this.context = context;
         this.splitReaderRef = Preconditions.checkNotNull(splitReaderRef);
 
         LOG.info(
@@ -68,13 +98,37 @@ public class RedisStreamsSourceReader<T>
     }
 
     @Override
+    public void start() {
+        try {
+            deserializationSchema.open(
+                    new DeserializationSchema.InitializationContext() {
+                        @Override
+                        public MetricGroup getMetricGroup() {
+                            return context.metricGroup().addGroup("deserializer");
+                        }
+
+                        @Override
+                        public UserCodeClassLoader getUserCodeClassLoader() {
+                            return context.getUserCodeClassLoader();
+                        }
+                    });
+        } catch (Exception e) {
+            throw new FlinkRuntimeException("Failed to open deserialization schema", e);
+        }
+        super.start();
+    }
+
+    @Override
     protected void onSplitFinished(Map<String, RedisStreamsSourceSplitState> finishedSplitIds) {
         LOG.info("Splits finished: {}", finishedSplitIds.keySet());
+        activeSplitStates.keySet().removeAll(finishedSplitIds.keySet());
     }
 
     @Override
     protected RedisStreamsSourceSplitState initializedState(RedisStreamsSourceSplit split) {
-        return new RedisStreamsSourceSplitState(split);
+        RedisStreamsSourceSplitState state = new RedisStreamsSourceSplitState(split);
+        activeSplitStates.put(split.splitId(), state);
+        return state;
     }
 
     @Override
@@ -88,7 +142,18 @@ public class RedisStreamsSourceReader<T>
         List<RedisStreamsSourceSplit> splits = super.snapshotState(checkpointId);
         RedisStreamsSplitReader reader = splitReaderRef.get();
         if (reader != null) {
-            reader.markCheckpoint(checkpointId);
+            // Drain only EMITTED entry IDs from split states. Records that were fetched but are
+            // still in the internal buffer (not yet through RecordEmitter) are NOT included —
+            // this is the key correctness guarantee: we only XACK what was durably emitted
+            // before the checkpoint barrier.
+            Map<String, List<String>> emittedIdsBySplit = new HashMap<>();
+            for (Map.Entry<String, RedisStreamsSourceSplitState> e : activeSplitStates.entrySet()) {
+                List<String> ids = e.getValue().drainDeferredAckIds();
+                if (!ids.isEmpty()) {
+                    emittedIdsBySplit.put(e.getKey(), ids);
+                }
+            }
+            reader.markCheckpoint(checkpointId, emittedIdsBySplit);
         }
         return splits;
     }
@@ -104,10 +169,10 @@ public class RedisStreamsSourceReader<T>
 
     @Override
     public void notifyCheckpointAborted(long checkpointId) throws Exception {
+        super.notifyCheckpointAborted(checkpointId);
         RedisStreamsSplitReader reader = splitReaderRef.get();
         if (reader != null) {
             reader.discardCheckpoint(checkpointId);
         }
-        super.notifyCheckpointAborted(checkpointId);
     }
 }

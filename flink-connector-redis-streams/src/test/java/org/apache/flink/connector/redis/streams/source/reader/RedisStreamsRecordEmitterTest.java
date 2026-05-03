@@ -28,6 +28,7 @@ import org.apache.flink.connector.redis.streams.source.split.RedisStreamsSourceS
 import io.lettuce.core.StreamMessage;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -130,8 +131,9 @@ class RedisStreamsRecordEmitterTest {
                 new RedisStreamsSourceSplitState(new RedisStreamsSourceSplit("s"));
 
         assertThatThrownBy(() -> emitter.emitRecord(message("s", "1-0", Map.of()), out, state))
-                .isInstanceOf(IllegalStateException.class)
-                .hasMessage("boom");
+                .isInstanceOf(IOException.class)
+                .hasCauseInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("Failed to deserialize record from stream s id 1-0");
         // Failed records do NOT advance the entry id — they remain in PEL for retry.
         assertThat(state.getCurrentEntryId()).isNull();
     }

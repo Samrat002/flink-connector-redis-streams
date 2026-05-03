@@ -19,27 +19,47 @@
 package org.apache.flink.connector.redis.streams.source.enumerator;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
-/** Checkpointed enumerator state: unassigned stream keys + frozen bounded-mode stopping IDs. */
+/**
+ * Immutable checkpointed enumerator state: unassigned stream keys + frozen bounded-mode stopping
+ * IDs. Both collections are defensively copied and made unmodifiable on construction so callers
+ * cannot mutate the snapshot after the fact.
+ */
 @Internal
 public class RedisStreamsSourceEnumeratorState {
 
     private final Set<String> pendingSplits;
     private final Map<String, String> stoppingEntryIds;
 
+    @VisibleForTesting
     public RedisStreamsSourceEnumeratorState(Set<String> pendingSplits) {
         this(pendingSplits, Collections.emptyMap());
     }
 
     public RedisStreamsSourceEnumeratorState(
             Set<String> pendingSplits, Map<String, String> stoppingEntryIds) {
-        this.pendingSplits = Objects.requireNonNull(pendingSplits);
-        this.stoppingEntryIds = Objects.requireNonNull(stoppingEntryIds);
+        Objects.requireNonNull(pendingSplits, "pendingSplits");
+        Objects.requireNonNull(stoppingEntryIds, "stoppingEntryIds");
+        for (Map.Entry<String, String> e : stoppingEntryIds.entrySet()) {
+            if (e.getValue() == null) {
+                throw new IllegalArgumentException(
+                        "stoppingEntryIds must not contain null values; key '"
+                                + e.getKey()
+                                + "' has a null value");
+            }
+        }
+        this.pendingSplits =
+                Collections.unmodifiableSet(new HashSet<>(pendingSplits));
+        this.stoppingEntryIds =
+                Collections.unmodifiableMap(new HashMap<>(stoppingEntryIds));
     }
 
     public Set<String> getPendingSplits() {

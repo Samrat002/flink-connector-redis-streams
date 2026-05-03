@@ -165,6 +165,19 @@ class RedisStreamsSplitReaderTest {
         return pending == null ? 0 : pending.getCount();
     }
 
+    /**
+     * Simulates what {@code RedisStreamsSourceReader.snapshotState()} does in the full pipeline:
+     * drains emitted IDs from split states and hands them to the split reader. In unit tests that
+     * drive the SplitReader directly (without the SourceReader/RecordEmitter), we pass the IDs
+     * returned by {@link #idsOf} as if they had already been emitted.
+     */
+    private static void markCheckpoint(
+            RedisStreamsSplitReader reader, long checkpointId, List<String> emittedIds) {
+        Map<String, List<String>> perSplit =
+                emittedIds.isEmpty() ? Map.of() : Map.of(STREAM, emittedIds);
+        reader.markCheckpoint(checkpointId, perSplit);
+    }
+
     @Test
     void backpressureSkipsFetchWhenQueueAtCapacity() throws Exception {
         RedisStreamsSplitReader reader =
@@ -174,14 +187,18 @@ class RedisStreamsSplitReaderTest {
         commands.xadd(STREAM, Map.of("f", "2"));
 
         reader.handleSplitsChanges(new SplitsAddition<>(List.of(unboundedSplit())));
-        idsOf(reader.fetch());
+        List<String> firstBatch = idsOf(reader.fetch());
+
+        // Simulate checkpoint: transfers fetched IDs into SplitReader's deferredAcks so that
+        // the back-pressure check (deferredAcks.size() >= maxDeferredAckQueueSize) kicks in.
+        markCheckpoint(reader, 1L, firstBatch);
 
         Deque<String> deferredAfterFirst = reader.getDeferredAcksForSplit(STREAM);
         assertThat(deferredAfterFirst).hasSize(2);
 
         commands.xadd(STREAM, Map.of("f", "3"));
         commands.xadd(STREAM, Map.of("f", "4"));
-        idsOf(reader.fetch());
+        idsOf(reader.fetch()); // should be skipped — queue at capacity
 
         assertThat(reader.getDeferredAcksForSplit(STREAM))
                 .containsExactlyElementsOf(deferredAfterFirst);
@@ -194,8 +211,8 @@ class RedisStreamsSplitReaderTest {
 
         commands.xadd(STREAM, Map.of("k", "a1"));
         commands.xadd(STREAM, Map.of("k", "a2"));
-        idsOf(reader.fetch());
-        reader.markCheckpoint(1L);
+        List<String> batch1 = idsOf(reader.fetch());
+        markCheckpoint(reader, 1L, batch1);
         reader.acknowledgeAllPendingMessagesAtCheckpoint(1L);
 
         assertThat(reader.getDeferredAcksForSplit(STREAM)).isEmpty();
@@ -204,8 +221,8 @@ class RedisStreamsSplitReaderTest {
         commands.xadd(STREAM, Map.of("k", "b1"));
         commands.xadd(STREAM, Map.of("k", "b2"));
         commands.xadd(STREAM, Map.of("k", "b3"));
-        idsOf(reader.fetch());
-        reader.markCheckpoint(2L);
+        List<String> batch2 = idsOf(reader.fetch());
+        markCheckpoint(reader, 2L, batch2);
         reader.acknowledgeAllPendingMessagesAtCheckpoint(2L);
 
         assertThat(reader.getDeferredAcksForSplit(STREAM)).isEmpty();
@@ -214,8 +231,8 @@ class RedisStreamsSplitReaderTest {
         for (int i = 0; i < 5; i++) {
             commands.xadd(STREAM, Map.of("k", "c" + i));
         }
-        idsOf(reader.fetch());
-        reader.markCheckpoint(3L);
+        List<String> batch3 = idsOf(reader.fetch());
+        markCheckpoint(reader, 3L, batch3);
         reader.acknowledgeAllPendingMessagesAtCheckpoint(3L);
 
         assertThat(reader.getDeferredAcksForSplit(STREAM)).isEmpty();
@@ -229,15 +246,19 @@ class RedisStreamsSplitReaderTest {
 
         commands.xadd(STREAM, Map.of("k", "barrier-1"));
         commands.xadd(STREAM, Map.of("k", "barrier-2"));
-        idsOf(reader.fetch());
-        reader.markCheckpoint(1L);
+        List<String> preBarrier = idsOf(reader.fetch());
+        // Checkpoint 1 snapshot: only the 2 pre-barrier IDs.
+        markCheckpoint(reader, 1L, preBarrier);
 
+        // Post-barrier records arrive and are fetched — but NOT included in checkpoint 1.
         commands.xadd(STREAM, Map.of("k", "post-barrier"));
         idsOf(reader.fetch());
+        // Do NOT call markCheckpoint for post-barrier records — they belong to checkpoint 2.
 
         reader.acknowledgeAllPendingMessagesAtCheckpoint(1L);
 
-        assertThat(reader.getDeferredAcksForSplit(STREAM)).hasSize(1);
+        // Pre-barrier IDs are XACKed; post-barrier ID is still in PEL.
+        assertThat(pelCount()).isEqualTo(1);
     }
 
     @Test
@@ -247,13 +268,13 @@ class RedisStreamsSplitReaderTest {
 
         commands.xadd(STREAM, Map.of("k", "x"));
         commands.xadd(STREAM, Map.of("k", "y"));
-        idsOf(reader.fetch());
+        List<String> batch = idsOf(reader.fetch());
 
-        reader.markCheckpoint(10L);
+        markCheckpoint(reader, 10L, batch);
         reader.discardCheckpoint(10L);
-        reader.acknowledgeAllPendingMessagesAtCheckpoint(10L);
+        reader.acknowledgeAllPendingMessagesAtCheckpoint(10L); // snapshot gone → no-op
 
-        assertThat(reader.getDeferredAcksForSplit(STREAM)).hasSize(2);
+        // Both IDs must still be in the PEL (not XACKed).
         assertThat(pelCount()).isEqualTo(2);
     }
 
@@ -264,13 +285,14 @@ class RedisStreamsSplitReaderTest {
 
         commands.xadd(STREAM, Map.of("k", "1"));
         commands.xadd(STREAM, Map.of("k", "2"));
-        idsOf(reader.fetch());
+        List<String> batch = idsOf(reader.fetch());
 
-        reader.markCheckpoint(5L);
+        markCheckpoint(reader, 5L, batch);
         reader.acknowledgeAllPendingMessagesAtCheckpoint(5L);
         assertThat(reader.getMaxCommittedCheckpointId()).isEqualTo(5L);
 
-        reader.markCheckpoint(3L);
+        // Checkpoint 3 arrives late — must be dropped (no double XACK, no state corruption).
+        markCheckpoint(reader, 3L, List.of());
         reader.acknowledgeAllPendingMessagesAtCheckpoint(3L);
         assertThat(reader.getMaxCommittedCheckpointId()).isEqualTo(5L);
     }
@@ -296,7 +318,9 @@ class RedisStreamsSplitReaderTest {
         List<String> steady = idsOf(readerB.fetch());
         assertThat(steady).hasSize(1).doesNotContainAnyElementsOf(firstFetch);
 
-        readerB.markCheckpoint(1L);
+        List<String> allRecoveredAndSteady = new ArrayList<>(recovered);
+        allRecoveredAndSteady.addAll(steady);
+        markCheckpoint(readerB, 1L, allRecoveredAndSteady);
         readerB.acknowledgeAllPendingMessagesAtCheckpoint(1L);
         assertThat(pelCount()).isZero();
     }
@@ -328,7 +352,7 @@ class RedisStreamsSplitReaderTest {
         }
         assertThat(recovered).containsExactlyElementsOf(all);
 
-        readerB.markCheckpoint(1L);
+        markCheckpoint(readerB, 1L, recovered);
         readerB.acknowledgeAllPendingMessagesAtCheckpoint(1L);
         assertThat(pelCount()).isZero();
     }
@@ -366,15 +390,16 @@ class RedisStreamsSplitReaderTest {
                         List.of(new RedisStreamsSourceSplit(STREAM, null, stoppingId))));
 
         boolean finished = false;
+        List<String> allIds = new ArrayList<>();
         for (int i = 0; i < 5 && !finished; i++) {
             RecordsWithSplitIds<StreamMessage<String, String>> r = reader.fetch();
-            idsOf(r);
+            allIds.addAll(idsOf(r));
             finished = r.finishedSplits().contains(STREAM);
         }
         assertThat(finished).isTrue();
         assertThat(pelCount()).isEqualTo(1);
 
-        reader.markCheckpoint(1L);
+        markCheckpoint(reader, 1L, allIds);
         reader.acknowledgeAllPendingMessagesAtCheckpoint(1L);
 
         assertThat(pelCount()).isZero();
@@ -396,6 +421,26 @@ class RedisStreamsSplitReaderTest {
 
         List<String> recovered = idsOf(readerB.fetch());
         assertThat(recovered).hasSize(1);
+    }
+
+    @Test
+    void startupModeLatestSkipsPreExistingEntries() throws Exception {
+        // Add messages BEFORE the consumer group exists
+        commands.xadd(STREAM, Map.of("k", "old-1"));
+        commands.xadd(STREAM, Map.of("k", "old-2"));
+
+        // LATEST startup mode creates the consumer group at $ (current stream tip),
+        // so pre-existing entries are invisible to the group.
+        RedisStreamsSplitReader reader =
+                newReader(cfg().setStartupMode(StartupMode.LATEST).build());
+        reader.handleSplitsChanges(new SplitsAddition<>(List.of(unboundedSplit())));
+
+        // First fetch must be empty — old messages are before the group's start position.
+        assertThat(idsOf(reader.fetch())).isEmpty();
+
+        // A new message published after the group is created must be delivered.
+        String newId = commands.xadd(STREAM, Map.of("k", "new-1"));
+        assertThat(idsOf(reader.fetch())).containsExactly(newId);
     }
 
     @Test

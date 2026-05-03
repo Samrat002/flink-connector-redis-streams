@@ -194,6 +194,30 @@ class RedisStreamsSourceConfigTest {
     }
 
     @Test
+    void clusterModeAcceptsIPv6Addresses() {
+        // IPv6 addresses use the LAST colon as port separator so "[::1]:6379" and
+        // "::1:6379" (shorthand) both parse correctly via lastIndexOf(':').
+        RedisStreamsSourceConfig cfg =
+                RedisStreamsSourceConfig.builder()
+                        .setStreamKeys(List.of("s"))
+                        .setClusterNodes(List.of("[::1]:7000", "192.168.1.1:7001"))
+                        .build();
+        assertThat(cfg.getClusterNodes()).containsExactly("[::1]:7000", "192.168.1.1:7001");
+    }
+
+    @Test
+    void clusterModeRejectsIPv6WithMissingPort() {
+        // "[::1]" with no port should be rejected (no colon after the bracket closes).
+        assertThatThrownBy(
+                        () ->
+                                RedisStreamsSourceConfig.builder()
+                                        .setStreamKeys(List.of("s"))
+                                        .setClusterNodes(List.of("[::1]"))
+                                        .build())
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
     void clusterModeBypassesStandaloneHostValidation() {
         // host="" would fail in standalone mode but is irrelevant in cluster mode.
         RedisStreamsSourceConfig config =

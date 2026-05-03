@@ -192,6 +192,13 @@ class RedisStreamsSplitReaderClusterTest {
         return pending == null ? 0 : pending.getCount();
     }
 
+    private static void markCheckpoint(
+            RedisStreamsSplitReader reader, long checkpointId, List<String> emittedIds) {
+        Map<String, List<String>> perSplit =
+                emittedIds.isEmpty() ? Map.of() : Map.of(STREAM, emittedIds);
+        reader.markCheckpoint(checkpointId, perSplit);
+    }
+
     @Test
     void clusterEndToEndFetchAckCycle() throws Exception {
         RedisStreamsSplitReader reader = newReader(cfg().setMaxDeferredAckQueueSize(100).build());
@@ -211,7 +218,7 @@ class RedisStreamsSplitReaderClusterTest {
         assertThat(pelCount()).isEqualTo(3);
 
         // Drive a checkpoint cycle and verify XACK lands.
-        reader.markCheckpoint(1L);
+        markCheckpoint(reader, 1L, fetched);
         reader.acknowledgeAllPendingMessagesAtCheckpoint(1L);
 
         assertThat(reader.getDeferredAcksForSplit(STREAM)).isEmpty();
@@ -230,8 +237,8 @@ class RedisStreamsSplitReaderClusterTest {
             for (int i = 0; i < cycle + 1; i++) {
                 commands.xadd(STREAM, Map.of("c", String.valueOf(cycle), "i", String.valueOf(i)));
             }
-            idsOf(reader.fetch());
-            reader.markCheckpoint(cycle);
+            List<String> batchIds = idsOf(reader.fetch());
+            markCheckpoint(reader, cycle, batchIds);
             reader.acknowledgeAllPendingMessagesAtCheckpoint(cycle);
 
             assertThat(reader.getDeferredAcksForSplit(STREAM))
@@ -268,7 +275,9 @@ class RedisStreamsSplitReaderClusterTest {
         List<String> steady = idsOf(readerB.fetch());
         assertThat(steady).hasSize(1).doesNotContainAnyElementsOf(firstFetch);
 
-        readerB.markCheckpoint(1L);
+        List<String> allRecoveredAndSteady = new ArrayList<>(recovered);
+        allRecoveredAndSteady.addAll(steady);
+        markCheckpoint(readerB, 1L, allRecoveredAndSteady);
         readerB.acknowledgeAllPendingMessagesAtCheckpoint(1L);
         assertThat(pelCount()).isZero();
     }

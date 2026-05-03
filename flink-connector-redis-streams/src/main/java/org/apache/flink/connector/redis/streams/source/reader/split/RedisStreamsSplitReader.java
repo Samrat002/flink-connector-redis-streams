@@ -95,8 +95,10 @@ public class RedisStreamsSplitReader
     private final Set<String> pausedSplits = new HashSet<>();
     private final Map<String, Deque<String>> deferredAcks = new HashMap<>();
     private final Map<String, CircuitBreaker> splitCircuitBreakers = new HashMap<>();
-    // checkpointId -> splitId -> max #IDs to ack from front of deferredAcks at that barrier.
-    private final Map<Long, Map<String, Integer>> checkpointAckSnapshots = new HashMap<>();
+    // checkpointId -> splitId -> ordered list of IDs emitted before that barrier.
+    // Populated via markCheckpoint() which is called from the task main thread; the IDs come
+    // from the split states' deferredAckIds queue, which only contains EMITTED records.
+    private final Map<Long, Map<String, List<String>>> checkpointAckSnapshots = new HashMap<>();
     private final Map<String, String> pendingRecoveryOffset = new HashMap<>();
     private final Set<String> pendingRecoveryComplete = new HashSet<>();
     private final Set<String> needsGroupInit = new HashSet<>();
@@ -333,18 +335,8 @@ public class RedisStreamsSplitReader
 
         stateLock.lock();
         try {
-            for (Map.Entry<String, Collection<StreamMessage<String, String>>> entry :
-                    recordsBySplit.entrySet()) {
-                String splitId = entry.getKey();
-                Collection<StreamMessage<String, String>> records = entry.getValue();
-                if (records.isEmpty()) {
-                    continue;
-                }
-                Deque<String> deferred =
-                        deferredAcks.computeIfAbsent(splitId, k -> new ArrayDeque<>());
-                for (StreamMessage<String, String> msg : records) {
-                    deferred.addLast(msg.getId());
-                }
+            // Record circuit-breaker success for splits that returned data.
+            for (String splitId : recordsBySplit.keySet()) {
                 CircuitBreaker breaker = splitCircuitBreakers.get(splitId);
                 if (breaker != null) {
                     breaker.recordSuccess();
@@ -430,6 +422,10 @@ public class RedisStreamsSplitReader
                     completeRecovery(streamKey);
                     return new FetchResult(pending, isPastStop(stoppingId, lastPendingId));
                 }
+                // Re-acquire the lock to advance the recovery cursor atomically. Without the lock
+                // a concurrent handleSplitsChanges() could reset pendingRecoveryOffset for this
+                // split between the XREADGROUP call above and the cursor update here, causing
+                // the recovery to restart from the wrong position.
                 stateLock.lock();
                 try {
                     pendingRecoveryOffset.put(streamKey, lastPendingId);
@@ -679,13 +675,35 @@ public class RedisStreamsSplitReader
         }
     }
 
-    /** Snapshot the deferred-ACK queue size per split as the upper bound for the next ACK pass. */
-    public void markCheckpoint(long checkpointId) {
+    /**
+     * Called by the task main thread at each checkpoint barrier. Receives the IDs of records that
+     * were actually emitted to downstream (from split states' deferred-ACK queues) and stores them
+     * for XACK after checkpoint completion.
+     *
+     * <p>The emitted IDs are also appended to {@link #deferredAcks} so that the back-pressure
+     * check in {@link #fetch()} correctly reflects the number of pending ACKs.
+     *
+     * @param checkpointId Flink checkpoint ID
+     * @param emittedIdsBySplit map of splitId → ordered list of entry IDs emitted before the
+     *     barrier (drained from {@code RedisStreamsSourceSplitState.drainDeferredAckIds()})
+     */
+    public void markCheckpoint(long checkpointId, Map<String, List<String>> emittedIdsBySplit) {
         stateLock.lock();
         try {
-            Map<String, Integer> snapshot = new HashMap<>();
-            for (Map.Entry<String, Deque<String>> entry : deferredAcks.entrySet()) {
-                snapshot.put(entry.getKey(), entry.getValue().size());
+            Map<String, List<String>> snapshot = new HashMap<>();
+            for (Map.Entry<String, List<String>> entry : emittedIdsBySplit.entrySet()) {
+                String splitId = entry.getKey();
+                List<String> ids = entry.getValue();
+                if (ids.isEmpty()) {
+                    continue;
+                }
+                snapshot.put(splitId, new ArrayList<>(ids));
+                // Append to deferredAcks for back-pressure accounting in fetch().
+                Deque<String> deferred =
+                        deferredAcks.computeIfAbsent(splitId, k -> new ArrayDeque<>());
+                for (String id : ids) {
+                    deferred.addLast(id);
+                }
             }
             checkpointAckSnapshots.put(checkpointId, snapshot);
         } finally {
@@ -695,7 +713,7 @@ public class RedisStreamsSplitReader
 
     /** XACK messages that crossed the {@code checkpointId} barrier; late notifies are dropped. */
     public void acknowledgeAllPendingMessagesAtCheckpoint(long checkpointId) {
-        Map<String, Integer> snapshot;
+        Map<String, List<String>> snapshot;
         stateLock.lock();
         try {
             if (checkpointId <= maxCommittedCheckpointId) {
@@ -708,6 +726,35 @@ public class RedisStreamsSplitReader
             }
             snapshot = checkpointAckSnapshots.remove(checkpointId);
             maxCommittedCheckpointId = checkpointId;
+
+            // Evict orphaned snapshots for checkpoints < checkpointId whose discardCheckpoint()
+            // was never called (e.g. JM crash mid-abort). Those IDs are still in deferredAcks
+            // inflating back-pressure. Remove them to prevent a permanent memory leak; the PEL
+            // will re-deliver the entries on the next recovery anyway.
+            checkpointAckSnapshots.entrySet().removeIf(e -> {
+                if (e.getKey() < checkpointId) {
+                    Map<String, List<String>> orphaned = e.getValue();
+                    if (orphaned != null) {
+                        for (Map.Entry<String, List<String>> splitEntry : orphaned.entrySet()) {
+                            Deque<String> deferred = deferredAcks.get(splitEntry.getKey());
+                            if (deferred != null) {
+                                for (String id : splitEntry.getValue()) {
+                                    if (id.equals(deferred.peekFirst())) {
+                                        deferred.removeFirst();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        LOG.warn(
+                                "Evicted orphaned checkpoint snapshot {} (discardCheckpoint was never called)",
+                                e.getKey());
+                    }
+                    return true;
+                }
+                return false;
+            });
         } finally {
             stateLock.unlock();
         }
@@ -716,32 +763,55 @@ public class RedisStreamsSplitReader
             return;
         }
 
-        for (Map.Entry<String, Integer> entry : snapshot.entrySet()) {
+        for (Map.Entry<String, List<String>> entry : snapshot.entrySet()) {
             String splitId = entry.getKey();
-            int limit = entry.getValue();
-            if (limit > 0) {
-                acknowledgeMessages(splitId, checkpointId, limit);
+            List<String> ids = entry.getValue();
+            if (!ids.isEmpty()) {
+                acknowledgeMessages(splitId, checkpointId, ids);
             }
         }
 
         cleanupAckedFinishedSplits();
     }
 
-    /** Clear any stored snapshot for an aborted checkpoint. */
+    /**
+     * Discards the snapshot for an aborted checkpoint and removes the associated IDs from
+     * {@link #deferredAcks} so they are re-captured at the next barrier.
+     */
     public void discardCheckpoint(long checkpointId) {
         stateLock.lock();
         try {
-            checkpointAckSnapshots.remove(checkpointId);
+            Map<String, List<String>> snapshot = checkpointAckSnapshots.remove(checkpointId);
+            if (snapshot != null) {
+                // Remove the aborted checkpoint's IDs from deferredAcks so that back-pressure
+                // is not permanently inflated. They will be re-added when the next checkpoint
+                // barrier drains the split states' deferredAckIds queues — but those IDs will
+                // not be re-added from SplitState since drainDeferredAckIds() already cleared them
+                // at the previous snapshotState(). The records themselves are safe: on recovery
+                // Flink replays from the last successful checkpoint and PEL re-delivers them.
+                for (Map.Entry<String, List<String>> entry : snapshot.entrySet()) {
+                    Deque<String> deferred = deferredAcks.get(entry.getKey());
+                    if (deferred != null) {
+                        for (String id : entry.getValue()) {
+                            String head = deferred.peekFirst();
+                            if (id.equals(head)) {
+                                deferred.removeFirst();
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         } finally {
             stateLock.unlock();
         }
     }
 
-    private boolean acknowledgeMessages(String splitId, long checkpointId, int limit) {
-        if (limit <= 0) {
+    private boolean acknowledgeMessages(String splitId, long checkpointId, List<String> idsToAck) {
+        if (idsToAck.isEmpty()) {
             return true;
         }
-        List<String> idsToAck;
         String streamKey;
         RedisClusterCommands<String, String> cmds;
 
@@ -750,37 +820,26 @@ public class RedisStreamsSplitReader
             cmds = commands;
             if (cmds == null) {
                 LOG.warn(
-                        "No connection for ACK of split {} at checkpoint {}; will retry",
+                        "No connection for ACK of split {} at checkpoint {}; "
+                                + "entries remain in PEL and will be re-delivered on recovery",
                         splitId,
                         checkpointId);
                 return false;
             }
-            Deque<String> deferred = deferredAcks.get(splitId);
-            if (deferred == null || deferred.isEmpty()) {
-                return true;
-            }
             RedisStreamsSourceSplit split = assignedSplits.get(splitId);
             // splitId == streamKey by design; fall back if split was already finished.
             streamKey = split != null ? split.getStreamKey() : splitId;
-            int count = Math.min(limit, deferred.size());
-            idsToAck = new ArrayList<>(count);
-            Iterator<String> it = deferred.iterator();
-            for (int i = 0; i < count; i++) {
-                idsToAck.add(it.next());
-            }
         } finally {
             stateLock.unlock();
         }
 
-        if (idsToAck.isEmpty()) {
-            return true;
-        }
-
         try {
             cmds.xack(streamKey, config.getConsumerGroup(), idsToAck.toArray(new String[0]));
+            LOG.debug("XACKed {} entries for split {} at checkpoint {}", idsToAck.size(), splitId, checkpointId);
         } catch (Exception e) {
             LOG.warn(
-                    "XACK failed for split {} at checkpoint {} ({} ids); will retry",
+                    "XACK failed for split {} at checkpoint {} ({} ids); "
+                                    + "entries remain in PEL and will be re-delivered on recovery",
                     splitId,
                     checkpointId,
                     idsToAck.size(),
@@ -794,7 +853,12 @@ public class RedisStreamsSplitReader
             if (deferred == null) {
                 return true;
             }
-            // Remove front IDs by equality so a FIFO drift surfaces instead of corrupting state.
+            // Remove front IDs by equality in strict FIFO order. A mismatch means the queue head
+            // doesn't match the next expected ID to ACK — this should never happen in practice
+            // because markCheckpoint() only adds IDs that RecordEmitter already emitted in order,
+            // and acknowledgeMessages() is called with that same ordered list. A mismatch would
+            // indicate a concurrent modification bug. We break rather than skip to avoid silently
+            // leaving orphaned IDs in the back-pressure counter.
             for (String id : idsToAck) {
                 String head = deferred.peekFirst();
                 if (head == null) {
@@ -804,7 +868,8 @@ public class RedisStreamsSplitReader
                     deferred.removeFirst();
                 } else {
                     LOG.warn(
-                            "Unexpected head of deferred queue for split {}: expected {}, found {}",
+                            "Unexpected head of deferred queue for split {}: expected {}, found {}. "
+                                    + "This may indicate a concurrent modification bug.",
                             splitId,
                             id,
                             head);

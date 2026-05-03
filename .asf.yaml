@@ -9,17 +9,13 @@ github:
     - big-data
     - java
     - real-time
+    - datastream
+    - table
+    - sql
   enabled_merge_buttons:
     squash: true
     merge: false
     rebase: true
-  labels:
-    - flink
-    - redis
-    - connector
-    - datastream
-    - table
-    - sql
   autolink_jira: FLINK
   collaborators:
     - flinkbot

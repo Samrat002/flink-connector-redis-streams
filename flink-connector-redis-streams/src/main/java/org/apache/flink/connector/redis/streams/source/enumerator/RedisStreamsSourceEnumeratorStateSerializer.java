@@ -30,8 +30,13 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Binary serializer for {@link RedisStreamsSourceEnumeratorState}. v1: pending +
- * discoveredStreamKeys (legacy, dropped). v2: pending only. v3: pending + stoppingEntryIds.
+ * Binary serializer for {@link RedisStreamsSourceEnumeratorState}.
+ *
+ * <p>Format (v1): {@code pendingCount (int) | pendingKeys (UTF…) | stoppingCount (int) |
+ * stoppingEntries (UTF key, UTF value)…}.
+ *
+ * <p>When the wire format changes in future releases, bump {@link #CURRENT_VERSION} and add a
+ * migration case to {@link #deserialize(int, byte[])}.
  */
 @Internal
 public class RedisStreamsSourceEnumeratorStateSerializer
@@ -40,9 +45,10 @@ public class RedisStreamsSourceEnumeratorStateSerializer
     public static final RedisStreamsSourceEnumeratorStateSerializer INSTANCE =
             new RedisStreamsSourceEnumeratorStateSerializer();
 
-    public static final int CURRENT_VERSION = 3;
+    /** Current serialization format version. Bump when the binary layout changes post-release. */
+    private static final int CURRENT_VERSION = 1;
 
-    private static final int SERIALIZER_INITIAL_CAPACITY = 128;
+    private static final int SERIALIZER_INITIAL_CAPACITY = 512;
 
     private RedisStreamsSourceEnumeratorStateSerializer() {}
 
@@ -63,7 +69,7 @@ public class RedisStreamsSourceEnumeratorStateSerializer
         out.writeInt(stoppingEntryIds.size());
         for (Map.Entry<String, String> e : stoppingEntryIds.entrySet()) {
             out.writeUTF(e.getKey());
-            out.writeUTF(e.getValue());
+            out.writeUTF(e.getValue()); // null values guarded by EnumeratorState constructor
         }
         return out.getCopyOfBuffer();
     }
@@ -71,6 +77,13 @@ public class RedisStreamsSourceEnumeratorStateSerializer
     @Override
     public RedisStreamsSourceEnumeratorState deserialize(int version, byte[] serialized)
             throws IOException {
+        if (version != CURRENT_VERSION) {
+            throw new IOException(
+                    "Unsupported serializer version: "
+                            + version
+                            + ". This connector has not been released yet; "
+                            + "please start fresh (no migration path from development snapshots).");
+        }
         DataInputDeserializer in = new DataInputDeserializer(serialized);
 
         int pendingSize = in.readInt();
@@ -79,26 +92,13 @@ public class RedisStreamsSourceEnumeratorStateSerializer
             pendingSplits.add(in.readUTF());
         }
 
-        if (version == 1) {
-            int discoveredSize = in.readInt();
-            for (int i = 0; i < discoveredSize; i++) {
-                in.readUTF();
-            }
-            return new RedisStreamsSourceEnumeratorState(pendingSplits);
+        int stoppingSize = in.readInt();
+        Map<String, String> stoppingEntryIds = new HashMap<>(stoppingSize);
+        for (int i = 0; i < stoppingSize; i++) {
+            String key = in.readUTF();
+            String value = in.readUTF();
+            stoppingEntryIds.put(key, value);
         }
-        if (version == 2) {
-            return new RedisStreamsSourceEnumeratorState(pendingSplits);
-        }
-        if (version == CURRENT_VERSION) {
-            int stoppingSize = in.readInt();
-            Map<String, String> stoppingEntryIds = new HashMap<>(stoppingSize);
-            for (int i = 0; i < stoppingSize; i++) {
-                String key = in.readUTF();
-                String value = in.readUTF();
-                stoppingEntryIds.put(key, value);
-            }
-            return new RedisStreamsSourceEnumeratorState(pendingSplits, stoppingEntryIds);
-        }
-        throw new IOException("Unsupported serializer version: " + version);
+        return new RedisStreamsSourceEnumeratorState(pendingSplits, stoppingEntryIds);
     }
 }

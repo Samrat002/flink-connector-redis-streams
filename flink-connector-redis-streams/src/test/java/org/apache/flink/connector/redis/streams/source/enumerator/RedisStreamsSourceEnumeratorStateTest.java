@@ -18,8 +18,6 @@
 
 package org.apache.flink.connector.redis.streams.source.enumerator;
 
-import org.apache.flink.core.memory.DataOutputSerializer;
-
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
@@ -75,44 +73,41 @@ class RedisStreamsSourceEnumeratorStateTest {
     }
 
     @Test
-    void v1PayloadDiscardsLegacyDiscoveredKeysAndYieldsEmptyStoppingMap() throws IOException {
-        DataOutputSerializer out = new DataOutputSerializer(64);
-        out.writeInt(1);
-        out.writeUTF("active");
-        out.writeInt(2);
-        out.writeUTF("active");
-        out.writeUTF("discovered-but-unused");
-
-        RedisStreamsSourceEnumeratorState restored =
-                RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.deserialize(
-                        1, out.getCopyOfBuffer());
-
-        assertThat(restored.getPendingSplits()).containsExactly("active");
-        assertThat(restored.getStoppingEntryIds()).isEmpty();
-    }
-
-    @Test
-    void v2PayloadYieldsEmptyStoppingMap() throws IOException {
-        DataOutputSerializer out = new DataOutputSerializer(64);
-        out.writeInt(2);
-        out.writeUTF("k1");
-        out.writeUTF("k2");
-
-        RedisStreamsSourceEnumeratorState restored =
-                RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.deserialize(
-                        2, out.getCopyOfBuffer());
-
-        assertThat(restored.getPendingSplits()).containsExactlyInAnyOrder("k1", "k2");
-        assertThat(restored.getStoppingEntryIds()).isEmpty();
-    }
-
-    @Test
-    void unsupportedVersionRejected() {
+    void unknownVersionRejected() {
+        // Any version other than CURRENT_VERSION (1) must be rejected cleanly.
         assertThatThrownBy(
                         () ->
                                 RedisStreamsSourceEnumeratorStateSerializer.INSTANCE.deserialize(
                                         99, new byte[] {0, 0, 0, 0}))
-                .isInstanceOf(IOException.class);
+                .isInstanceOf(IOException.class)
+                .hasMessageContaining("Unsupported");
+    }
+
+    @Test
+    void stateIsImmutableAfterConstruction() {
+        // Mutations of the input collections must not affect the stored state.
+        Set<String> mutablePending = new HashSet<>(Set.of("stream-a"));
+        Map<String, String> mutableStopping = new java.util.HashMap<>(Map.of("stream-a", "100-0"));
+        RedisStreamsSourceEnumeratorState state =
+                new RedisStreamsSourceEnumeratorState(mutablePending, mutableStopping);
+
+        mutablePending.add("intruder");
+        mutableStopping.put("intruder", "0-0");
+
+        assertThat(state.getPendingSplits()).doesNotContain("intruder");
+        assertThat(state.getStoppingEntryIds()).doesNotContainKey("intruder");
+    }
+
+    @Test
+    void nullValueInStoppingEntryIdsRejected() {
+        Map<String, String> withNull = new java.util.HashMap<>();
+        withNull.put("stream-a", null);
+        assertThatThrownBy(
+                        () ->
+                                new RedisStreamsSourceEnumeratorState(
+                                        Set.of("stream-a"), withNull))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("null values");
     }
 
     @Test

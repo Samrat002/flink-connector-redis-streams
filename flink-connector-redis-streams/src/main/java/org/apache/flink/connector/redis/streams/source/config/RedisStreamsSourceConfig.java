@@ -21,9 +21,13 @@ package org.apache.flink.connector.redis.streams.source.config;
 import org.apache.flink.annotation.PublicEvolving;
 import org.apache.flink.util.Preconditions;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 
@@ -35,22 +39,51 @@ import java.util.UUID;
  *
  * <p>The effective per-subtask consumer name is {@code <consumerName>-<subtaskIndex>}. Pinning
  * {@code consumerName} explicitly is required to preserve PEL recovery across parallelism changes
- * or redeploys; the default UUID-suffixed name changes on each {@code Builder.build()}.
+ * or redeploys; the default UUID-suffixed name changes on each {@code Builder.build()}, which
+ * will orphan PEL entries from any previous run.
+ *
+ * <p><strong>Important:</strong> The default {@link #DEFAULT_CONSUMER_GROUP} is intended for
+ * single-job local testing only. If two unrelated Flink jobs connect to the same Redis with the
+ * same consumer-group name, they will share message delivery — each entry is routed to exactly one
+ * of the two jobs, silently starving the other. Always set an explicit consumer group in
+ * production.
  */
 @PublicEvolving
 public class RedisStreamsSourceConfig implements Serializable {
 
     private static final long serialVersionUID = 2L;
+    private static final Logger LOG = LoggerFactory.getLogger(RedisStreamsSourceConfig.class);
 
+    /**
+     * Default consumer group name — for single-job local testing only. See class-level Javadoc for
+     * the cross-job interference risk when two jobs share the same group name.
+     */
     public static final String DEFAULT_CONSUMER_GROUP = "flink-consumer-group";
     public static final String DEFAULT_HOST = "localhost";
     public static final int DEFAULT_PORT = 6379;
     public static final int DEFAULT_DATABASE = 0;
+    /** Block timeout passed to {@code XREADGROUP}. 1 s balances latency vs. CPU idle-looping. */
     public static final long DEFAULT_POLL_TIMEOUT_MS = 1000L;
+    /** Number of entries requested per {@code XREADGROUP} call. */
     public static final int DEFAULT_BATCH_SIZE = 100;
+    /**
+     * Maximum number of entry IDs that may sit in the deferred-ACK queue for a single split before
+     * fetch is skipped (back-pressure). Must be {@code >= batchSize} to avoid a permanent livelock
+     * where a single fetch fills the queue and prevents it from draining.
+     */
     public static final int DEFAULT_MAX_DEFERRED_ACK_QUEUE_SIZE = 10_000;
+    /**
+     * How long a split's circuit breaker stays open after {@link
+     * #DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD} consecutive failures. 5 s is large enough to
+     * survive transient Redis blips but small enough to recover quickly.
+     */
     public static final long DEFAULT_CIRCUIT_BREAKER_OPEN_DURATION_MS = 5_000L;
+    /**
+     * Number of consecutive per-split failures before the circuit breaker opens. 3 gives a small
+     * retry budget before isolation, keeping one bad stream key from blocking the entire reader.
+     */
     public static final int DEFAULT_CIRCUIT_BREAKER_FAILURE_THRESHOLD = 3;
+    /** Interval at which the Lettuce cluster client refreshes its topology view. */
     public static final long DEFAULT_CLUSTER_TOPOLOGY_REFRESH_PERIOD_MS = 60_000L;
 
     private static final String CONSUMER_NAME_PREFIX = "flink-consumer-";
@@ -288,7 +321,9 @@ public class RedisStreamsSourceConfig implements Serializable {
                     Preconditions.checkArgument(
                             node != null && !node.isEmpty(),
                             "clusterNodes entries must not be null or empty");
-                    int colon = node.indexOf(':');
+                    // Use lastIndexOf so IPv6 addresses like [::1]:6379 are handled correctly
+                    // (the port separator is always the last colon).
+                    int colon = node.lastIndexOf(':');
                     Preconditions.checkArgument(
                             colon > 0 && colon < node.length() - 1,
                             "clusterNodes entries must be of the form host:port: "
@@ -325,9 +360,19 @@ public class RedisStreamsSourceConfig implements Serializable {
                         key != null && !key.isEmpty(),
                         "streamKeys must not contain null or empty entries");
             }
+            Preconditions.checkArgument(
+                    new HashSet<>(streamKeys).size() == streamKeys.size(),
+                    "streamKeys must not contain duplicates: " + streamKeys);
             Preconditions.checkNotNull(consumerGroup, "consumerGroup must be set");
             Preconditions.checkArgument(
                     !consumerGroup.isEmpty(), "consumerGroup must not be empty");
+            if (DEFAULT_CONSUMER_GROUP.equals(consumerGroup)) {
+                LOG.warn(
+                        "Using default consumerGroup '{}'. This is intended for local testing only. "
+                                + "Two Flink jobs sharing the same group against the same Redis will "
+                                + "silently split message delivery. Set an explicit consumerGroup in production.",
+                        DEFAULT_CONSUMER_GROUP);
+            }
             Preconditions.checkNotNull(startupMode, "startupMode must be set");
             Preconditions.checkArgument(batchSize > 0, "batchSize must be positive");
             Preconditions.checkArgument(pollTimeout > 0, "pollTimeout must be positive");

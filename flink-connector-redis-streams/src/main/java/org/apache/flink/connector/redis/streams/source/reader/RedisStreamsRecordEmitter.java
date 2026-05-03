@@ -24,15 +24,20 @@ import org.apache.flink.connector.redis.streams.source.RedisStreamsDeserializati
 import org.apache.flink.connector.redis.streams.source.split.RedisStreamsSourceSplitState;
 
 import io.lettuce.core.StreamMessage;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
-/** Record emitter that deserializes Redis StreamMessages. */
+import java.io.IOException;
+
+/**
+ * Record emitter that deserializes Redis StreamMessages.
+ *
+ * <p>After each record (including null/filtered ones), the entry ID is registered in the split
+ * state's deferred-ACK queue. This ensures that only records that have actually been emitted past
+ * the checkpoint barrier are XACKed after checkpoint completion — preventing silent data loss on
+ * crash recovery.
+ */
 @Internal
 public class RedisStreamsRecordEmitter<T>
         implements RecordEmitter<StreamMessage<String, String>, T, RedisStreamsSourceSplitState> {
-
-    private static final Logger LOG = LoggerFactory.getLogger(RedisStreamsRecordEmitter.class);
 
     private final RedisStreamsDeserializationSchema<T> deserializationSchema;
 
@@ -50,19 +55,21 @@ public class RedisStreamsRecordEmitter<T>
             T record =
                     deserializationSchema.deserialize(
                             element.getStream(), element.getId(), element.getBody());
-            // Null records are filter results, not failures, and must still be
-            // ACKed so they don't grow the PEL forever.
             splitState.setCurrentEntryId(element.getId());
+            // Register BEFORE collecting: if collect() throws the entry ID is still in the
+            // deferred queue and will be re-delivered on PEL recovery rather than orphaned.
+            // Null records are filter results — they still need to be XACKed to drain the PEL.
+            splitState.addDeferredAckId(element.getId());
             if (record != null) {
                 output.collect(record);
             }
         } catch (Exception e) {
-            LOG.error(
-                    "Failed to deserialize record from stream {} id {}",
-                    element.getStream(),
-                    element.getId(),
+            throw new IOException(
+                    "Failed to deserialize record from stream "
+                            + element.getStream()
+                            + " id "
+                            + element.getId(),
                     e);
-            throw e;
         }
     }
 }

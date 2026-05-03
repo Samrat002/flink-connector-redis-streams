@@ -23,17 +23,36 @@ import org.apache.flink.util.Preconditions;
 
 import javax.annotation.Nullable;
 
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.List;
 import java.util.Objects;
 
-/** Mutable per-split state — the latest entry ID emitted by the record emitter. */
+/**
+ * Mutable per-split state. Tracks the latest emitted entry ID (for observability/restore) and the
+ * IDs of records emitted since the last checkpoint barrier (for deferred XACK). All fields are
+ * accessed exclusively from the task main thread — no synchronisation is required.
+ */
 @Internal
 public class RedisStreamsSourceSplitState {
 
     private final RedisStreamsSourceSplit split;
     @Nullable private String currentEntryId;
 
+    /**
+     * IDs of records emitted via {@link
+     * org.apache.flink.connector.redis.streams.source.reader.RedisStreamsRecordEmitter} since the
+     * last call to {@link #drainDeferredAckIds()}. Populated on the task main thread; drained at
+     * each checkpoint barrier to guarantee that only <em>emitted</em> records are XACKed after
+     * checkpoint completion.
+     */
+    private final Deque<String> deferredAckIds = new ArrayDeque<>();
+
     public RedisStreamsSourceSplitState(RedisStreamsSourceSplit split) {
         this.split = Preconditions.checkNotNull(split, "split");
+        // startingEntryId carries the last checkpointed position for observability;
+        // server-side consumer-group state drives actual positioning via XREADGROUP >.
         this.currentEntryId = split.getStartingEntryId();
     }
 
@@ -48,6 +67,26 @@ public class RedisStreamsSourceSplitState {
 
     public void setCurrentEntryId(String currentEntryId) {
         this.currentEntryId = currentEntryId;
+    }
+
+    /**
+     * Registers {@code id} as an emitted record that must be XACKed after the next checkpoint
+     * completes. Called by the record emitter after each successful {@code output.collect()} —
+     * including null/filtered records which still need to be removed from the Redis PEL.
+     */
+    public void addDeferredAckId(String id) {
+        deferredAckIds.addLast(id);
+    }
+
+    /**
+     * Returns all IDs accumulated since the last call and clears the internal queue. Called by
+     * {@link org.apache.flink.connector.redis.streams.source.reader.RedisStreamsSourceReader} at
+     * checkpoint barrier time to hand the emitted IDs over to the split reader for XACK.
+     */
+    public List<String> drainDeferredAckIds() {
+        List<String> ids = new ArrayList<>(deferredAckIds);
+        deferredAckIds.clear();
+        return ids;
     }
 
     public RedisStreamsSourceSplit toSplit() {
